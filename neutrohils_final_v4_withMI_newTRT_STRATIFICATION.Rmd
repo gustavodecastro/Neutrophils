@@ -1,0 +1,2095 @@
+---
+title: "Neutrophils"
+author: "Gustavo"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+always_allow_html: true
+output:
+  html_document:
+    highlight: tango
+    number_sections: no
+    theme: paper
+    toc: no
+    toc_float: no
+  pdf_document:
+    toc: no
+  word_document:
+    toc: yes
+---
+
+```{r include=FALSE}
+## cultura = liquid, solid, mtb complex, liquid_mtb_complex
+## mes 2, cavidades no tempo 0 (raio-X, uploaded ou nao)
+
+# X-Ray compatible with TB?
+# X-Ray (principalmente cavidade - xray_cavit)
+# baseline and m2 (raio-x upload 1 and 2, sim pegar os NIDS)  
+# adiocnar BCG na tabela
+# bcgscar ou bcgvacc, ever_tb, Alcohol Triage, smokyrs, diseasehx
+# lab_hgapct, dicotomizado, no mes 0 e 2
+# solid_result_count, no mes 2 
+# td_mtb, qto menos dias 
+## hipotese: tempo curto ou solido alto, cultura positiva no mes 2
+# hepb_result, criar uma variavel Hepatite A + B
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+library(dplyr)
+library(gdata)
+library(kableExtra)
+library(survey)
+library(readxl)
+library(lubridate)
+library(sjPlot)
+library(rms)
+library(mice)
+library(psych)
+library(Hmisc)
+library(tidyverse)
+library(quantreg)
+library(RColorBrewer)
+library(survival)
+library(magrittr)
+library(flextable)
+library(ggpubr)
+library(compareGroups)
+library(lme4)
+#detach(package:plyr)
+```
+
+
+```{r, warning=FALSE}
+boot_func <- function(data, formula_ps, regmodel, B=B, reg2=FALSE, regHIV=FALSE) {
+
+  data <- data %>% mutate(lab_neut_disc = cut(neutrophils, breaks=c(0, quantile(neutrophils, probs=seq(.025, .975, len=40), na.rm=TRUE), Inf)),
+                          lab_neut_disc = as.numeric(lab_neut_disc))
+  
+  m1 <- orm(formula_ps, data=data)
+  data$ps <- predict(m1, type='mean')
+
+  ddist <- datadist(data)
+  options(datadist='ddist')
+  model_0 <- rms::lrm(regmodel, data=data, x=TRUE, y=TRUE)
+  
+  coefs <- c()
+  for (i in 1:B){
+    sampB <- sample(1:nrow(data), nrow(data), replace = TRUE)
+    dataB <- data[sampB,]
+    model <- rms::lrm(regmodel, data=dataB, x=TRUE, y=TRUE)
+    coefs. <- coef(model)
+    coefs  <- rbind(coefs., coefs)
+  }
+  coefs_boots <- exp(apply(coefs, 2, mean))[2]
+  var_boots <- apply(coefs, 2, var)
+  cis <- exp(apply(coefs, 2, function(x) quantile(x, probs=c(0.025, 0.975)))[,2])
+  coefs_df <- data.frame(est=coefs_boots, lci=cis[1], uci=cis[2])
+  return(list(coefs_df=coefs_df, model=model_0, data=data))
+}
+```
+
+```{r, warning=FALSE}
+#mi_func <- function(regmodel1, formula1, data, M, minx=0.025, maxx=.975, maxn=40) {
+mi_func <- function(regmodel1, formula1, data, M, minx=0.1, maxx=.9, maxn=9) {
+  seqx <- seq(minx, maxx, len=maxn)
+  data <- data %>% mutate(lab_neut_disc = cut(neutrophils, breaks=c(0, quantile(neutrophils, probs=seqx, na.rm=TRUE), Inf)),
+                          lab_neut_disc = as.numeric(lab_neut_disc))
+  dd <- mice(data, m=M, printFlag=FALSE)
+  dd <- mice::complete(dd, "all")
+  mfit <- list()
+  for (ii in 1:M){
+    dd_temp <- dd[[ii]]
+    m1 <- orm(formula1, data=dd_temp)
+    #dd_temp$ps <- predict(m1, type='mean')
+
+    probs_m1 <- predict(m1, type='fitted')
+    probs_add <- rep(NA, nrow(probs_m1))
+    for (i in 1:nrow(probs_m1)){
+      level_fact <- as.numeric(as.character(dd_temp$lab_neut_disc[i]))
+      probs_add[i] <- ifelse(level_fact==1, 1-probs_m1[i,1],
+                             ifelse(level_fact==max(level_fact), probs_m1[i,max(level_fact)-1],
+                                    probs_m1[i,level_fact-1] - probs_m1[i,level_fact]))
+    }
+    dd_temp$ps <- probs_add
+
+    m1 <- lm(formula1, data=dd_temp)
+    dd_temp$ps2 <- dnorm(predict(m1, type='response'), mean=residuals(m1), sd(residuals(m1)))
+    m0 <- lm(I(sqrt(neutrophils)) ~ 1, data=dd_temp)
+    dd_temp$ps1 <- dnorm(predict(m0, type='response'), mean=residuals(m0), sd(residuals(m0)))
+    #dd_temp$ps <- dd_temp$ps1/dd_temp$ps2
+#    dd_temp$ps <- dd_temp$ps1
+    
+    y <- all.vars(regmodel1)[1]
+    if (y == "smear_result")
+      dd_temp$smear_result <- ifelse(dd_temp$smear_result == 'Positive', 1, 0)
+    if (y == "smear_result_m2")
+      dd_temp$smear_result_m2 <- ifelse(dd_temp$smear_result_m2 == 'Positive', 1, 0)
+    if (y == "mtb_m2")
+      dd_temp$mtb_m2 <- ifelse(dd_temp$mtb_m2 == 'Positive', 1, 0)
+    if (y == "trt_failure")
+      dd_temp$trt_failure <- ifelse(dd_temp$trt_failure == 'Unfavorable', 1, 0)
+    
+    mfit[[ii]] <- glm(regmodel1, data=dd_temp, family=binomial)
+    
+    dd_temp$resp_var <- dd_temp[,y]
+    quintiles <- quantile(dd_temp$ps, prob = seq(from = 0,to = 1, by = 0.2), na.rm = T)
+    dd_temp$pseq <- cut(dd_temp$ps, breaks = quintiles, labels = 1:5, include.lowest = T)
+    coef_str <- c()
+    for (jj in 1:5){
+      coef_str[jj] <- coef(glm(resp_var ~ neutrophils, data = dd_temp, subset = pseq==jj, family = binomial))[2]
+    }
+    
+  }
+  coefs_trt <- pool(mfit)
+  coefs_pool <- coefs_trt$pooled[2,3]
+  sd_pool    <- sqrt(coefs_trt$pooled[2,4])
+  cis <- c(coefs_pool - 1.96*sd_pool, coefs_pool + 1.96*sd_pool)
+  res_trt <- exp(data.frame(est=coefs_pool, lci=cis[1], uci=cis[2]))
+  return(list(res_trt=res_trt, res_str=as.data.frame(exp(mean(coef_str)))))
+}
+```
+
+```{r mixed effect, warning=FALSE}
+#mi_func <- function(regmodel1, formula1, data, M, minx=0.025, maxx=.975, maxn=40) {
+mi_func_me <- function(regmodel1, formula1, data, M, minx=0.1, maxx=.9, maxn=9) {
+  seqx <- seq(minx, maxx, len=maxn)
+  data <- data %>% mutate(lab_neut_disc = cut(neutrophils, breaks=c(0, quantile(neutrophils, probs=seqx, na.rm=TRUE), Inf)),
+                          lab_neut_disc = as.numeric(lab_neut_disc))
+  dd <- mice(data, m=M, printFlag=FALSE)
+  dd <- mice::complete(dd, "all")
+  mfit <- list()
+  for (ii in 1:M){
+    dd_temp <- dd[[ii]]
+    m1 <- lm(formula1, data=dd_temp)
+    dd_temp$ps2 <- dnorm(predict(m1, type='response'), mean=residuals(m1), sd(residuals(m1)))
+    m0 <- lm(I(sqrt(neutrophils)) ~ 1, data=dd_temp)
+    dd_temp$ps1 <- dnorm(predict(m0, type='response'), mean=residuals(m0), sd(residuals(m0)))
+  #  dd_temp$ps <- dd_temp$ps1/dd_temp$ps2
+ #   dd_temp$ps <- dd_temp$ps1
+    
+    m1 <- orm(formula1, data=dd_temp)
+    probs_m1 <- predict(m1, type='fitted')
+    probs_add <- rep(NA, nrow(probs_m1))
+    for (i in 1:nrow(probs_m1)){
+      level_fact <- as.numeric(as.character(dd_temp$lab_neut_disc[i]))
+      probs_add[i] <- ifelse(level_fact==1, 1-probs_m1[i,1],
+                             ifelse(level_fact==max(level_fact), probs_m1[i,max(level_fact)-1],
+                                    probs_m1[i,level_fact-1] - probs_m1[i,level_fact]))
+    }
+    dd_temp$ps <- probs_add
+    
+    y <- all.vars(regmodel1)[1]
+    if (y == "smear_result")
+      dd_temp$smear_result <- ifelse(dd_temp$smear_result == 'Positive', 1, 0)
+    if (y == "smear_result_m2")
+      dd_temp$smear_result_m2 <- ifelse(dd_temp$smear_result_m2 == 'Positive', 1, 0)
+    if (y == "mtb_m2")
+      dd_temp$mtb_m2 <- ifelse(dd_temp$mtb_m2 == 'Positive', 1, 0)
+    if (y == "trt_failure")
+      dd_temp$trt_failure <- ifelse(dd_temp$trt_failure == 'Unfavorable', 1, 0)
+    
+    mfit[[ii]] <- glmer(regmodel1, data=dd_temp, family=binomial)
+    
+    dd_temp$resp_var <- dd_temp[,y]
+    quintiles <- quantile(dd_temp$ps, prob = seq(from = 0,to = 1, by = 0.2), na.rm = T)
+    dd_temp$pseq <- cut(dd_temp$ps, breaks = quintiles, labels = 1:5, include.lowest = T)
+    coef_str <- c()
+    for (jj in 1:5){
+      coef_str[jj] <- coef(glm(resp_var ~ neutrophils, data = dd_temp, subset = pseq==jj, family = binomial))[2]
+    }
+  }
+  coefs_pool <- mean(sapply(mfit, FUN=function(x) summary(x)$coef[2,1]))
+  sd_pool    <- sqrt(mean(sapply(mfit, FUN=function(x) summary(x)$coef[2,2]^2)))
+  cis <- c(coefs_pool - 1.96*sd_pool, coefs_pool + 1.96*sd_pool)
+  res_trt <- exp(data.frame(est=coefs_pool, lci=cis[1], uci=cis[2]))
+  return(list(res_trt=res_trt, res_str=as.data.frame(exp(mean(coef_str)))))
+}
+```
+
+
+```{r, warning=FALSE}
+vars_cg <- c("bl_age", "race", 'race2', "sex", "HIV", "bl_weight", "bl_height",
+             "bmi", "smokhx", 'smokhx2', "smokyrs", "alcoholhx", 'alcoholhx2', 'bcgscar',
+             "alcool_years", "bl_agedrink", 'xray_cavit', 'xray_cavit2',"edulevel", "educ_years", "hhincome", "hhincome2",
+             "diabetes_cat", "diabetes_cat2", 'lab_hgb_bin',
+             'dot_yesno', "lab_hgapct", "lab_platlet", "lab_lymp", "lab_wbc", 'lab_hgb', "lab_neut", 'sites', "SITE", 'neutrophils',
+             'ttohiv_yesno_ttoform', 'lab_cd4')
+vars_cg_m2 <- c("bl_age", "race", 'race2', "sex", "HIV", "bl_weight",
+                "bl_height", "bmi", "smokhx", 'smokhx2', "smokyrs", "alcoholhx", 'alcoholhx2', 'bcgscar',
+             "alcool_years", "bl_agedrink", 'xray_cavit', 'xray_cavit2', "edulevel", "educ_years", "hhincome", "hhincome2",
+             "diabetes_cat", "diabetes_cat2", 'lab_hgb_bin',
+             'dot_yesno', "lab_hgapct", "lab_platlet", "lab_lymp", "lab_wbc", 'lab_hgb', "lab_neut", 'sites', "SITE", 'neutrophils',
+             'cough_change', 'fever_change', 'nightswt_change', 'wtloss_change', 'ttohiv_yesno_ttoform', 'lab_cd4')
+
+vars_cg <- c("bl_age", "race", 'race2', "sex", "HIV", "bl_weight", "bl_height",
+             "bmi", "smokhx", 'smokhx2', "smokyrs", "alcoholhx", 'alcoholhx2', 'bcgscar',
+             "alcool_years", "bl_agedrink", 'xray_cavit', 'xray_cavit2',"edulevel", "educ_years", "hhincome", "hhincome2",
+             "diabetes_cat", "diabetes_cat2", 'lab_hgb_bin',
+             'dot_yesno', "lab_hgapct", "lab_platlet", "lab_lymp", "lab_wbc", 'lab_hgb', "lab_neut", 'sites', "SITE", 'neutrophils',
+             'ttohiv_yesno_ttoform', 'lab_cd4')
+vars_cg_m2 <- c("bl_age", "race", 'race2', "sex", "HIV", "bl_weight",
+                "bl_height", "bmi", "smokhx", 'smokhx2', "smokyrs", "alcoholhx", 'alcoholhx2', 'bcgscar',
+             "alcool_years", "bl_agedrink", 'xray_cavit', 'xray_cavit2', "edulevel", "educ_years", "hhincome", "hhincome2",
+             "diabetes_cat", "diabetes_cat2", 'lab_hgb_bin',
+             'dot_yesno', "lab_hgapct", "lab_platlet", "lab_lymp", "lab_wbc", 'lab_hgb', "lab_neut", 'sites', "SITE", 'neutrophils',
+             'cough_change', 'fever_change', 'nightswt_change', 'wtloss_change', 'ttohiv_yesno_ttoform', 'lab_cd4')
+
+vars_reg <- c('neutrophils', 'bl_age', 'sex', 'smokhx2', 'race2', 'alcoholhx2', 'xray_cavit2', 'lab_hgapct', 'lab_lymp',
+              'lab_platlet', 'lab_hgb', 'HIV', 'lab_neut', 'dot_yesno', 'HIV',
+              'cough_change', 'fever_change', 'nightswt_change', 'wtloss_change', 'sites')
+
+give.n <- function(x){
+  return(c(y = median(x)*1.05, label = length(x))) 
+  # experiment with the multiplier to find the perfect position
+}
+
+func_vars <- function(x) {
+  vars_factors <- c('HIV', 'race2', 'sex', 'smokhx', 'smokhx2', 'alcoholhx', 'alcoholhx2', 'bcgscar',
+                    'xray_cavit', 'diabetes_cat', 'diabetes_cat2', 'SITE')
+  for (ii in 1:length(vars_factors)){
+    x[,vars_factors[ii]] <- as.factor(x[,vars_factors[ii]])
+  }
+  x
+}
+
+regmodel <- as.formula(mtb_m2 ~ neutrophils + I(log(ps/(1-ps))))
+regmodel_bl <- as.formula(smear_result ~ neutrophils + I(log(ps/(1-ps))))
+regmodel_m2 <- as.formula(smear_result_m2 ~ neutrophils + I(log(ps/(1-ps))))
+regmodel_hiv_m2 <- as.formula(smear_result_m2 ~ neutrophils + I(log(ps/(1-ps))))
+regmodel_trt <- as.formula(trt_failure ~ neutrophils + I(log(ps/(1-ps))))
+regmodel_trt <- as.formula(trt_failure ~ neutrophils + I(log(ps/(1-ps))))
+
+#regmodel <- as.formula(mtb_m2 ~ neutrophils + ps)
+#regmodel_bl <- as.formula(smear_result ~ neutrophils + ps)
+#regmodel_m2 <- as.formula(smear_result_m2 ~ neutrophils + ps)
+#regmodel_hiv_m2 <- as.formula(smear_result_m2 ~ neutrophils + ps)
+#regmodel_trt <- as.formula(trt_failure ~ neutrophils + ps)
+
+regmodel_trt_me <- as.formula(trt_failure ~ neutrophils + ps + (1|sites))
+
+formula_trt_noHIV <- as.formula(lab_neut_disc ~ rcs(bl_age,3)*sex + smokhx2 + race2 + alcoholhx2 + xray_cavit2 + dot_yesno +
+                                  rcs(I(log(lab_hgapct)), 3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) + rcs(lab_hgb,3)  +
+                                  #cough_change + fever_change + nightswt_change + wtloss_change + sites)
+                                   sites)
+
+formula_ps <- as.formula(lab_neut_disc ~ rcs(bl_age,3)*sex + smokhx2 + rcs(bl_age,3)*race2 + alcoholhx2 + xray_cavit2 + dot_yesno + HIV +
+                           rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) +
+                           #rcs(lab_hgb,3) + cough_change + fever_change + nightswt_change + wtloss_change + sites)
+                           rcs(lab_hgb,3) + sites)
+
+formula_surv <- as.formula(lab_neut_disc ~ rcs(bl_age,3)*sex + smokhx2 + race2 + alcoholhx2 + xray_cavit2 + dot_yesno + HIV +
+                           rcs(bl_age,3)+rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) + rcs(lab_hgb,3) +
+                           #cough_change + fever_change + nightswt_change + wtloss_change + sites)
+                             sites)
+
+formula_surv_noHIV <- as.formula(lab_neut_disc ~ rcs(bl_age,3)*sex + smokhx2 + race2 + alcoholhx2 + xray_cavit2 + dot_yesno +
+                           rcs(bl_age,3)+rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) + rcs(lab_hgb,3) +
+                           #cough_change + fever_change + nightswt_change + wtloss_change + sites)
+                              sites)
+
+formula_surv_HIV <- as.formula(lab_neut_disc ~ rcs(bl_age, 3) * sex + smokhx2 + race2 + alcoholhx2 + 
+    xray_cavit2 + dot_yesno + I(log(lab_hgapct)) + I(log(lab_lymp)) + I(log(lab_platlet)) + lab_hgb + sites)
+formula_surv_noHIV <- as.formula(lab_neut_disc ~ rcs(bl_age, 3) * sex + smokhx2 + race2 + alcoholhx2 + 
+    xray_cavit2 + dot_yesno + I(log(lab_hgapct)) + I(log(lab_lymp)) + I(log(lab_platlet)) + lab_hgb + sites)
+
+
+formula_ps_noHIV <- as.formula(lab_neut_disc ~ rcs(bl_age,3)*sex + rcs(bl_age,3)+smokhx2 + race2 + alcoholhx2 + xray_cavit2 +
+                                 rcs(bl_age,3)+rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) +
+                                 #rcs(lab_hgb,3) + cough_change + fever_change + nightswt_change + wtloss_change + sites)
+                                 rcs(lab_hgb,3) + sites)
+
+formula_ps_HIV <- as.formula(lab_neut_disc ~ rcs(bl_age,3)*sex + smokhx2 + race2 + alcoholhx2 + xray_cavit2 + lab_cd4 + ttohiv_yesno +
+                                 rcs(bl_age,3)+rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) +
+                                 #cough_change + fever_change + nightswt_change + wtloss_change + sites)
+                                sites)
+
+formula_ps_bl <- as.formula(lab_neut_disc ~ rcs(bl_age,3)*sex + rcs(bl_age,3)+smokhx2 + race2 + alcoholhx2 + xray_cavit2 + HIV +
+                              rcs(bl_age,3)+rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) +
+                              rcs(lab_hgb,3) + sites)
+
+formula_ps_bl_noHIV <- as.formula(lab_neut_disc ~ rcs(bl_age,3)*sex + rcs(bl_age,3)+smokhx2 + race2 + alcoholhx2 + xray_cavit2 +
+                                    rcs(bl_age,3)+rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) +
+                                    rcs(lab_hgb,3) + sites)
+
+```
+
+```{r new I(sqrt(neutrophils)), eval=FALSE, include=FALSE}
+formula_trt_noHIV <- as.formula(I(sqrt(neutrophils)) ~ rcs(bl_age,3)*sex + smokhx2 + race2 + alcoholhx2 + xray_cavit2 + dot_yesno +
+                                  rcs(I(log(lab_hgapct)), 3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) + rcs(lab_hgb,3)  +
+                                  #cough_change + fever_change + nightswt_change + wtloss_change + sites)
+                                   sites)
+
+formula_ps <- as.formula(I(sqrt(neutrophils)) ~ rcs(bl_age,3)*sex + smokhx2 + rcs(bl_age,3)*race2 + alcoholhx2 + xray_cavit2 + dot_yesno + HIV +
+                           rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) +
+                           #rcs(lab_hgb,3) + cough_change + fever_change + nightswt_change + wtloss_change + sites)
+                           rcs(lab_hgb,3) + sites)
+
+formula_surv <- as.formula(I(sqrt(neutrophils)) ~ rcs(bl_age,3)*sex + smokhx2 + race2 + alcoholhx2 + xray_cavit2 + dot_yesno + HIV +
+                           rcs(bl_age,3)+rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) + rcs(lab_hgb,3) +
+                           #cough_change + fever_change + nightswt_change + wtloss_change + sites)
+                             sites)
+
+formula_surv_noHIV <- as.formula(I(sqrt(neutrophils)) ~ rcs(bl_age,3)*sex + smokhx2 + race2 + alcoholhx2 + xray_cavit2 + dot_yesno +
+                           rcs(bl_age,3)+rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) + rcs(lab_hgb,3) +
+                           #cough_change + fever_change + nightswt_change + wtloss_change + sites)
+                              sites)
+
+formula_surv_HIV <- as.formula(I(sqrt(neutrophils)) ~ rcs(bl_age, 3) * sex + smokhx2 + race2 + alcoholhx2 + 
+    xray_cavit2 + dot_yesno + I(log(lab_hgapct)) + I(log(lab_lymp)) + I(log(lab_platlet)) + lab_hgb + sites)
+formula_surv_noHIV <- as.formula(I(sqrt(neutrophils)) ~ rcs(bl_age, 3) * sex + smokhx2 + race2 + alcoholhx2 + 
+    xray_cavit2 + dot_yesno + I(log(lab_hgapct)) + I(log(lab_lymp)) + I(log(lab_platlet)) + lab_hgb + sites)
+
+
+formula_ps_noHIV <- as.formula(I(sqrt(neutrophils)) ~ rcs(bl_age,3)*sex + rcs(bl_age,3)+smokhx2 + race2 + alcoholhx2 + xray_cavit2 +
+                                 rcs(bl_age,3)+rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) +
+                                 #rcs(lab_hgb,3) + cough_change + fever_change + nightswt_change + wtloss_change + sites)
+                                 rcs(lab_hgb,3) + sites)
+
+formula_ps_HIV <- as.formula(I(sqrt(neutrophils)) ~ rcs(bl_age,3)*sex + smokhx2 + race2 + alcoholhx2 + xray_cavit2 + lab_cd4 + ttohiv_yesno +
+                                 rcs(bl_age,3)+rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) +
+                                 #cough_change + fever_change + nightswt_change + wtloss_change + sites)
+                                sites)
+
+formula_ps_bl <- as.formula(I(sqrt(neutrophils)) ~ rcs(bl_age,3)*sex + rcs(bl_age,3)+smokhx2 + race2 + alcoholhx2 + xray_cavit2 + HIV +
+                              rcs(bl_age,3)+rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) +
+                              rcs(lab_hgb,3) + sites)
+
+formula_ps_bl_noHIV <- as.formula(I(sqrt(neutrophils)) ~ rcs(bl_age,3)*sex + rcs(bl_age,3)+smokhx2 + race2 + alcoholhx2 + xray_cavit2 +
+                                    rcs(bl_age,3)+rcs(I(log(lab_hgapct)),3) + rcs(I(log(lab_lymp)),3) + rcs(I(log(lab_platlet)),3) +
+                                    rcs(lab_hgb,3) + sites)
+```
+
+
+
+```{r, warning=FALSE}
+data_all <- read.table('C:/Users/amorigg1/OneDrive - VUMC/Documents/Afranio/data_afranio_mariana.csv', sep=',')
+data_all2 <- read.table("C:/Users/amorigg1/OneDrive - VUMC/Documents/Afranio/cohort_a_data_25jun2020.csv", header=TRUE, sep=',') %>%
+  filter(redcap_event_name == 'formulrio_mltiplo_arm_1') %>% dplyr::select(subjid, dot_yesno)
+data_all <- data_all %>% dplyr::select(-dot_yesno) %>% left_join(data_all2, by='subjid')
+data_all$trt_failure <- as.factor(data_all$trt_failure)
+
+## tratamento
+n1 <- data_all[which(data_all$final_cohaoutb___1==1),]$subjid %>% as.character() # cura
+n2 <- data_all[which(data_all$final_cohaoutb___2==1),]$subjid %>% as.character() # cura
+n3 <- data_all[which(data_all$final_cohaoutb___4==1),]$subjid %>% as.character() # cura
+n4 <- data_all[which(data_all$final_cohaoutb___6==1),]$subjid %>% as.character() # cura
+n5 <- data_all[which(data_all$final_cohaoutb___8==1),]$subjid %>% as.character() # cura
+
+n6 <- data_all[which(data_all$final_cohaoutb___3==1),]$subjid %>% as.character() # desfavoravel
+n7 <- data_all[which(data_all$final_cohaoutb___7==1),]$subjid %>% as.character() # desfavoravel
+n8 <- data_all[which(data_all$final_cohaoutb___11==1),]$subjid %>% as.character() # desfavoravel
+
+n9 <- data_all[which(data_all$final_cohaoutb___5==1),]$subjid %>% as.character()
+n10 <- data_all[which(data_all$final_cohaoutb___12==1),]$subjid %>% as.character()
+nt <- c(n1, n2, n3, n4, n5, n6, n7, n8, n9, n10)
+
+nc <- c(n1, n2, n3, n4, n5)
+ids_es <- data_all[data_all$earlystop_date != "",]$subjid %>% as.character()
+id_ea5 <- data_all[data_all$subjid %in% ids_es,] %>% filter(earlystop_reason==5); id_ea5 <- as.character(id_ea5$subjid)
+ea_s <- data_all[data_all$subjid %in% id_ea5[!(id_ea5 %in% nc)] & data_all$redcap_event_name=='sada_prematura_arm_1' & data_all$tb_treat_yesno==1,]$subjid
+ea_s <- as.character(ea_s)
+
+ids_cade <- data_all$subjid[!(data_all$subjid %in% c(as.character(nt), as.character(ids_es)))]
+data_cade <- data_all %>% filter(subjid %in% ids_cade) %>% dplyr::select(subjid, bl_visdat, m2_visdat, end_visdat, call_visdat) %>% mutate(days = as.numeric(dmy('01/11/2020') - dmy(bl_visdat))) #%>% filter(bl_visdat != "")
+data_cade_m2 <- data_cade %>% filter(m2_visdat != "") %>% dplyr::select(subjid, m2_visdat);
+data_cade_end <- data_cade %>% filter(end_visdat != "") %>% dplyr::select(subjid, end_visdat);
+data_cade_call <- data_cade %>% filter(call_visdat != "") %>% dplyr::select(subjid, call_visdat);
+data_cade <- data_cade %>% filter(bl_visdat != "") %>% dplyr::select(subjid, bl_visdat) %>% left_join(data_cade_m2, by='subjid') %>%
+  left_join(data_cade_end, by='subjid') %>% left_join(data_cade_call, by='subjid')
+ids_cade <- data_all %>% filter(subjid %in% ids_cade) %>% dplyr::select(subjid, bl_visdat) %>% mutate(days = as.numeric(dmy('25/06/2020') - dmy(bl_visdat))) %>% filter(bl_visdat != "") %>% filter(days > 365.25 * 1.5) %>% dplyr::select(subjid) %>% .$subjid %>% as.character()
+
+nc <- c(n1, n2, n3, n4, n5, ea_s, ids_cade, 'A104145')
+
+ids_desf <- c(n6,n7,n8, as.character(data_all[which(data_all$earlystop_reason==3),]$subjid))
+
+data_all <- data_all %>% mutate(trt_failure = ifelse(subjid %in% ids_desf, 1,
+                                                     ifelse(subjid %in% nc, 0, NA))) %>%
+  mutate(trt_success = 1-trt_failure)
+  
+nn <- data_all[!(data_all$subjid %in% c(ids_desf, nc)),]$subjid
+#data_all[data_all$subjid %in% nn & data_all$redcap_event_name=='sada_prematura_arm_1',]$tb_treat_yesno
+
+data_all$neutrophils <- NA
+#data_all[data_all$redcap_event_name == 'visita_inicial_arm_1',]$neutrophils <-
+#  sqrt(data_all[data_all$redcap_event_name == 'visita_inicial_arm_1',]$lab_neut/100)
+data_all[data_all$redcap_event_name == 'visita_inicial_arm_1',]$neutrophils <-
+  data_all[data_all$redcap_event_name == 'visita_inicial_arm_1',]$lab_neut
+
+data_all$dot_yesno <- ifelse(is.na(data_all$dot_yesno), NA, ifelse(data_all$dot_yesno==1, 'Yes', 'No'))
+data_all$alcoholhx2 <- ifelse(is.na(data_all$alcoholhx2), NA, ifelse(data_all$alcoholhx2=='atualmente consome alcool', 'Yes', 'No'))
+data_all$race2 <- ifelse(is.na(data_all$race2), NA, ifelse(data_all$race2 == 'negro', 'black', 'non-black'))
+data_all$smokhx2 <- ifelse(is.na(data_all$smokhx2), NA, ifelse(data_all$smokhx2 == 'atualmente fumava', 'Yes', 'No'))
+data_all$xray_cavit2 <- ifelse(is.na(data_all$xray_cavit), NA,
+                               ifelse(data_all$xray_cavit == 'nao', 'No',
+                                      ifelse(data_all$xray_cavit == 'sim', 'Yes', NA)))
+data_all$sex <- ifelse(is.na(data_all$sex), NA, ifelse(data_all$sex == 'masculino', 'male', 'female'))
+data_all$lab_hgb_bin <- ifelse(is.na(data_all$lab_hgb), NA,
+                           ifelse(data_all$sex=='male' & data_all$lab_hgb < 12, 'Yes',
+                                  ifelse(data_all$sex=='male' & data_all$lab_hgb >= 12, 'No',
+                                         ifelse(data_all$sex=='female' & data_all$lab_hgb < 13.5, 'Yes', 'No'))))
+data_all$cough_change <- as.factor(data_all$cough_change)
+data_all$fever_change <- as.factor(data_all$fever_change)
+data_all$wtloss_change <- as.factor(data_all$wtloss_change)
+data_all$nightswt_change <- as.factor(data_all$nightswt_change)
+
+data_all$bcgscar <- as.factor(data_all$bcgscar)
+
+data_all <- data_all %>% mutate(diabetes_cat = ifelse(is.na(lab_hgapct), NA,
+                                                      ifelse(lab_hgapct == 6.5, '6.5+', as.character(diabetes_cat))))
+
+data_all <- data_all %>% mutate(diabetes_cat2 = ifelse(is.na(lab_hgapct), NA,
+                                                      ifelse(lab_hgapct == 6.5, '6.5+', as.character(diabetes_cat2))))
+
+onART1  <- data_all[which(data_all$ttohiv_yesno_ttoform==1),]$subjid
+onART0  <- data_all[which(data_all$ttohiv_yesno_ttoform==0),]$subjid
+onARTNA <- data_all[which(data_all$ttohiv_yesno_ttoform==2),]$subjid
+onART3  <- data_all[which(data_all$ttohiv_yesno_ttoform==3),]$subjid
+data_all <- data_all %>% mutate(ttohiv_yesno_ttoform = ifelse(subjid %in% onART1, 'Yes', 
+                                                              ifelse(subjid %in% onART0, 'No', NA)))
+
+day_es1 <- data_all %>% filter(trt_failure==1) %>% filter(earlystop_date != "") %>% dplyr::select(subjid, earlystop_reason, earlystop_date)
+day_es1_end <- data_all %>% filter(subjid %in% day_es1$subjid) %>% dplyr::select(subjid, end_visdat) %>% filter(end_visdat != "")
+day_es1 <- day_es1 %>% left_join(day_es1_end, by='subjid') %>% mutate(days = ifelse(is.na(end_visdat), NA,
+                                                                                    as.numeric(dmy(earlystop_date) - dmy(end_visdat)) ))
+no_es <- unique(data_all$subjid[which(data_all$trt_failure==1)][!(data_all$subjid[which(data_all$trt_failure==1)] %in% day_es1$subjid)])
+day_es2 <- data_all %>% filter(trt_failure==1 & subjid %in% no_es) %>% dplyr::select(subjid, tbmr_final, final_date, final_cohaoutb___3, end_visdat)
+day_es2a <- day_es2 %>% filter(final_date != "") %>% dplyr::select(subjid, final_date)
+day_es2b <- day_es2 %>% filter(end_visdat != "") %>% dplyr::select(subjid, end_visdat)
+day_es2 <- day_es2a %>% left_join(day_es2b, by='subjid') %>% mutate(days = ifelse(is.na(end_visdat), NA,
+                                                                                  as.numeric(dmy(final_date) - dmy(end_visdat)) ))
+
+
+
+data_all$lab_platlet <- data_all$lab_platlet/10^4
+data_all$lab_neut <- data_all$lab_neut/10^3
+data_all$lab_wbc <- data_all$lab_wbc/10^3
+data_all$lab_lymp <- data_all$lab_lymp/10^2
+data_all$neutrophils <- data_all$neutrophils/10^3
+data_all$dot_yesno <- as.factor(data_all$dot_yesno)
+data_all$xray_cavit2 <- as.factor(data_all$xray_cavit2)
+
+
+set.seed(1)
+B <- 999
+M <- 20
+```
+
+
+# Exploring objective 1 {.tabset} 
+
+<div id="quarterly-product" class="section level3">
+
+
+## Introduction {.tabset} 
+
+#### Overview:
+
+This report addresses the concept sheet “The effect of blood neutrophil level, and HIV infection on TB treatment response”.  The concept sheet focus on two objectives:
+
+1.	Evaluate the association of neutrophil in the day 0 of treatment between TB patients, infected or not by HIV, with culture conversion after 2 months of treatment. 
+2.	Evaluate the association of neutrophilia or neutropenia in day 0 of treatment and poor treatment outcome, which is defined as any of the following: unsuccessful treatment (death, treatment failure, TB recurrence) vs. successful treatment (cure, treatment completion)
+
+#### Goal 1:
+
+We start by discussing associations between neutrophil counts at baseline with smear results, first at baseline, then later at month 2. The analysis is stratified with respect to HIV status. Next, we move on to culture result at month 2 and check for associations with neutrophil counts at baseline. As before, we start with an overall analysis, including HIV status as a covariate, and then add a stratified analysis with respect to HIV status. Firstly, only patients with culture results (positive or negative) at month 2 are used. However, as some patients haveing missing culture results at month 2, we repeat our previous analysis incuding them as culture negative at month 2.
+
+In all sections we ran univariate and multivariable regressions. Univariate comparisons were computed via the Mann-Whitney-Wilcoxon test or chi-squared test, for continuous and categorical variables, respectively. Multivariable logistic regressions were used to account for confounding variables. Due to limited sample size, in particular for all stratified analysis or when computing association between neutrophils at baseline and culture at month 2, we also did a propensity score regression adjustment. The exposure variable, neutrophil counts at baseline, were discretized into K = 20 strata and modelled in terms of sex, age, race, smoking status, alcohol status, education level, income status, x-ray cavitation, study site, and lab values of plaquettes, lymphocytes and glycated hemoglobin. For comparisons at month 2, we also included whether the most prevalent symptoms, namely cough, night sweats, fever and weight loss, improved at month 2 compared to baseline visit. The propensity score model was fitted using an ordinal model, which is robust under model misspecification. We used restricted cubic splines for continuous variables, to relax the linearity assumption. The predicted propensity score was then included in the main model to assess the association between neutrophil counts at baseline (squared root transformed) and the outcome (smear result or culture result at month 2).
+
+#### Goal 2:
+
+We follow a similar approach to objective 1. We use propensity score regression adjustment to assess the associations between neutrophils at baseline with treatment status. Treatment status is defined as either unsuccessful or successful. The former is defined as death, treatment failure or TB recurrence, while the latter is defined as cured or treatment completion with no evidence of failure or recurrence in 24 months of follow-up. 
+
+We start with a multivariable logistic regression, with treatment status as outcome and use propensity scores to account for possible confounders. We use the same variables as those for objective 1. Results are derived for all data with HIV as covariate, as well as for patients stratified on HIV status. Next we fit a Cox proportional hazards regression, where participants with less than 24 months of follow up or with no final treatment outcome will be censored at their last contact date. Results for both objectives are expressed in terms of point estimates and 95% confidence intervals.
+
+
+#### Summary
+
+**Smear results at month 2:**
+- Overall: No significative association with baseline neutrophils;
+- HIV-: No significative association with baseline neutrophils;
+- HIV+: Somewhat associated with low baseline neutrophils. Lower neutrophil counts leads to higher chance of smear positive at month 2.
+
+**Culture at month 2:**
+- Overall: No significative association with baseline neutrophils;
+- HIV-: Weak to no association with baseline neutrophils. Higher neutrophil counts suggest higher chance of culture positive at month 2;
+- HIV+: significative results, very small sample size.
+
+**Treatment status:**
+- Overall: Associated with baseline neutrophils. Higher neutrophil counts are correlated with unsuccessful treatment;
+- HIV-: Associated with baseline neutrophils. Higher neutrophil counts are correlated with unsuccessful treatment;
+- HIV+: No significative results.
+
+**Time to Treatment failure:**
+- Overall: Somewhat associated with baseline neutrophils. Higher neutrophil counts increase the hazard of unsuccessful treatment;
+- HIV-: Associated with baseline neutrophils. Higher neutrophil counts increase the hazard of unsuccessful treatment;
+
+
+**Note:** There may be room for improvement. The propensity score regression adjustment assumes a fixed propensity score while regressing the outcome on neutrophil counts. This is of course not precise, as the propensity scores are estimated from a regression model. In other other wods, the variance and CI computed do not take this extra variability into account. However, what we have may be  conservative approach, as using the *true* propensity score instead of the *estimated* may lead innefficient estimates of the parameters of interest (see Robins et al (1994) for explanation for this counter-intuitive argument). This should be explored further, basically estimating the propensity score within the bootstrap samples. More to discuss.
+
+
+
+
+## Smear result {.tabset}
+
+### HIV status
+
+```{r, warning=FALSE}
+all_culture_pos <- length(which(data_all$cultura_LiqSol_result_m2[data_all$redcap_event_name=='ms_2_visita_arm_1']=='positive'))
+all_culture_neg <- length(which(data_all$cultura_LiqSol_result_m2[data_all$redcap_event_name=='ms_2_visita_arm_1']=='negative'))
+all_culture_NA <- sum(is.na(data_all$cultura_LiqSol_result_m2[data_all$redcap_event_name=='ms_2_visita_arm_1']))
+positive_mtb <- sum(data_all$cultura_mtb_m2[data_all$redcap_event_name=='ms_2_visita_arm_1']=='positive')
+
+dd <- data_all
+dd$cultura_LiqSol_result_m2 <- as.character(dd$cultura_LiqSol_result_m2)
+dd$cultura_LiqSol_result_m2[is.na(dd$cultura_LiqSol_result_m2)] <- 'Not available'
+nas_id <- dd[dd$redcap_event_name=='ms_2_visita_arm_1',] %>% filter(cultura_LiqSol_result_m2 == 'Not available') %>% dplyr::select(subjid)
+
+dd1 <- data_all %>% filter(redcap_event_name %in% c('visita_inicial_arm_1')) %>% as.data.frame() %>% droplevels()
+data_culture_m2 <- data_all %>% filter(redcap_event_name == 'ms_2_visita_arm_1') %>% mutate(mtb_m2 = cultura_mtb_m2) %>% dplyr::select(subjid, mtb_m2)
+data_merge2 <- dd1 %>% #filter(subjid %in% data_culture_m2$subjid) %>%
+  left_join(data_culture_m2, by='subjid') %>%
+  mutate(mtb_m2 = ifelse(mtb_m2 == 'NA', NA,
+                         ifelse(mtb_m2 == 'negative', 0, 1)))
+dd2 <- data_merge2 %>% dplyr::select(vars_cg, mtb_m2, 'trt_failure', 'smear_result') %>%
+  mutate(mtb_m2 = ifelse(mtb_m2==1, 'Positive', 'Negative'),
+         trt_failure = ifelse(trt_failure==1, 'Unfavorable', 'Favorable'),
+         smear_result = ifelse(smear_result==1, 'Positive', 'Negative'))
+
+cg_HIV_bl <- compareGroups(HIV ~ ., data=dd2, max.xlev=20, method=2)
+cg_HIV_bl <- createTable(cg_HIV_bl, show.ratio = TRUE, show.all=TRUE)
+export2md(cg_HIV_bl, size = 8, width = "80px")
+```
+
+### At baseline
+
+```{r, warning=FALSE}
+data_bl <- data_all %>% filter(redcap_event_name %in% c('visita_inicial_arm_1')) %>% as.data.frame() %>% droplevels()
+data_bl <- data_bl %>% filter(!is.na(smear_result) & !is.na(lab_neut)) %>% mutate(smear_result = ifelse(smear_result==1, 'Positive', 'Negative'))
+
+cg_smear  <- compareGroups(smear_result ~ ., data=data_bl[, c('smear_result', vars_cg)], max.xlev=20, method=2)
+cg_seartb <- createTable(cg_smear, show.ratio = TRUE, show.all=TRUE)
+
+cg_smear_hiv_status  <- compareGroups(HIV ~ ., data=data_bl[, c('smear_result', vars_cg)], max.xlev=20, method=2)
+cg_smear_hiv_statustb <- createTable(cg_smear_hiv_status, show.ratio = TRUE, show.all=TRUE)
+
+
+#data_smear_bl_mariana <- data_bl %>% dplyr::select(subjid, lab_neut, smear_result, HIV)
+#write.table(data_smear_bl_mariana, file = 'C:/users/amorigg1/OneDrive - VUMC/Documents/Afranio/data_smear_bl_mariana.csv', row.names = FALSE, col.names = TRUE, sep=',')
+
+data_bl_reg <- data_bl %>% func_vars(.) %>% dplyr::select(vars_reg, 'smear_result')
+
+neut_test <- wilcox.test(lab_neut ~ smear_result, data=data_bl)
+
+
+pval <- ifelse(neut_test$p.value < 0.001, '<0.001', round(neut_test$p.value,3))
+stat.test <- tibble::tribble(
+  ~group1, ~group2,   ~p.adj,
+    "Positive",     "Negative", pval
+  )
+
+
+data_bl. <- data_bl
+data_bl.$smear_result <- as.factor(data_bl.$smear_result)
+#plot_smear_bl <- ggplot(data_bl, aes(x=smear_result, y=lab_neut, fill=smear_result)) + geom_boxplot() + theme_classic() + 
+plot_smear_bl <- ggboxplot(data_bl., x='smear_result', y='lab_neut', fill='smear_result', palette = c("#00AFBB", "#E7B800")) +
+  #ylab(expression(paste('Neutrophil counts at baseline (x ', 10^3,'/mm'^3, ')'))) +  
+  #ylab(expression(atop('Neutrophil counts', paste('at baseline (x ',10^3,'/mm'^3, ')')))) +
+  ylab(expression(paste('Neutrophil counts at baseline (x  ',10^3,'/mm'^3, ')'))) +
+  #xlab('Smear result at baseline') + 
+  xlab('') + labs(color='Smear Result at Baseline') + guides(fill=FALSE) + theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) + stat_pvalue_manual(stat.test, y.position = 25, step.increase = 0.1, label = "p.adj")
+
+#update_geom_defaults("point", list(colour = "black"))
+#data_bl. %>% ggplot(aes(x=smear_result, y=lab_neut))+  
+#  geom_boxplot(show.legend = F, aes(fill=smear_result),outlier.color = NA) +
+#  geom_point(position=position_jitterdodge(jitter.width=.5, dodge.width = 0), 
+#             pch=21, aes(fill=factor(smear_result)), show.legend = F) + theme_classic() +
+#   scale_fill_brewer(palette = 'BrBG') +
+#  scale_fill_manual(values = c("Negative" = "aquamarine4",
+#                               "Positive" = "orange"))
+
+
+
+reg_smear_bsl <- mi_func(regmodel_bl, formula_ps_bl, data=data_bl_reg, M=M)
+```
+
+
+We start by checking smear results at baseline and neutrophils also at baseline. A total of `r length(data_bl$smear_result)` people have some smear results, of which `r sum(data_bl$smear_result==1, na.rm=TRUE)` turned out to be positive. Some of their characteristics, stratified by smear result, is shown below.
+
+```{r, warning=FALSE}
+export2md(cg_seartb, size = 8, width = "80px")
+```
+
+We want to see how neutrophil counts vary across the two groups, smear positive and smear negative. From the univariate comparisons above, we notice that the mean values differ between the two groups. This is also noticed via the boxplot below. This figure contains `r sum(!is.na(data_bl$lab_neut))` observations from baseline, this is because `r sum(is.na(data_bl$lab_neut)) + sum(is.na(data_bl$smear_result==1))` patients do not have neutrophil values and 1 has no smear result.
+
+```{r, fig.align='center'}
+plot_smear_bl
+```
+
+As suggested by the boxplot, we see statistically significant differences in neutrophil counts, between smear positive and negative patients. A non-parametric Wilcoxon rank tests gives a **pvalue of `r round(neut_test$p.value,3)`**, which is highly signficative. 
+
+**Adjusted regression:**
+
+```{r, warning=FALSE}
+#reg_smear_bsl %>% kable(., digits = 3) %>% kable_styling()
+regulartable(reg_smear_bsl$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+```{r, warning=FALSE}
+#reg_smear_bsl %>% kable(., digits = 3) %>% kable_styling()
+regulartable(reg_smear_bsl$res_str) %>% theme_zebra() %>% autofit()
+```
+
+The odds of being smear positive is higher with larger neutrophil counts. 
+
+
+
+### Excluding HIV
+
+Next we do a stratified analysis on HIV.
+We remove those with HIV+. First, a visual comparison of neutrophil counts at baseline stratified by MTB culture at month 2:
+
+```{r, warning=FALSE}
+data_bl_reg_HIVneg <- data_bl_reg %>% filter(HIV == 'No')
+
+test_noHIV <- wilcox.test(lab_neut ~ smear_result, data=data_bl_reg_HIVneg)
+
+pval_smear_noHIV <- ifelse(test_noHIV$p.value < 0.001, '<0.001', round(test_noHIV$p.value,3))
+stat.test_smear_noHIV <- tibble::tribble(
+  ~group1, ~group2,   ~p.adj,
+    "Positive",     "Negative", pval_smear_noHIV
+  )
+
+plot_smear_bl_noHIV <- ggboxplot(data_bl_reg_HIVneg, x='smear_result', y='lab_neut', fill='smear_result', palette = c("#00AFBB", "#E7B800")) + 
+  ylab(expression(paste('Neutrophil counts at baseline (x  ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color='Smear Result at Baseline') + guides(fill=FALSE) +
+  theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,25) +
+  stat_pvalue_manual(stat.test_smear_noHIV, y.position = 25, step.increase = 0.1, label = "p.adj")
+
+reg_smear_bslHIVneg <- mi_func(regmodel_bl, formula_ps_bl_noHIV, data=data_bl_reg, M=M)
+```
+
+```{r, warning=FALSE}
+cg_smear_nohiv <- compareGroups(smear_result ~ . - HIV, data=data_bl_reg_HIVneg, max.xlev=20, method=2)
+cg_smear_nohivtab1 <- createTable(cg_smear_nohiv, show.ratio = TRUE, show.all=TRUE)
+```
+
+```{r, warning=FALSE}
+plot_smear_bl_noHIV
+```
+
+As suggested by the boxplot, we do see a statistical difference on baseline neutrophil counts between those that have positive versus negative MTB culture at month 2. The nonparametric test gives a pvalue of **`r round(test_noHIV$p.value, 3)`**. 
+
+**Adjusted regression:**
+
+```{r, warning=FALSE}
+#reg_smear_bslHIVneg %>% kable(., digits = 3) %>% kable_styling()
+regulartable(reg_smear_bslHIVneg$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+
+```{r, warning=FALSE}
+#reg_smear_bslHIVneg %>% kable(., digits = 3) %>% kable_styling()
+regulartable(reg_smear_bslHIVneg$res_str) %>% theme_zebra() %>% autofit()
+```
+
+
+
+
+### Keeping HIV only
+
+Now we remove those with HIV-. First, a visual comparison of neutrophil counts at baseline stratified by MTB culture at month 2:
+
+```{r, warning=FALSE}
+data_bl_reg_HIV <- data_bl_reg %>% filter(HIV == 'Yes')
+
+plot_smear_bl_HIV <- ggplot(data_bl_reg_HIV, aes(x=smear_result, y=lab_neut, fill=smear_result)) +
+  geom_boxplot() + theme_classic() + 
+  #ylab(expression(paste('Neutrophil counts at baseline (x ', 10^3,'/mm'^3, ')'))) +
+  ylab(expression(atop('Neutrophil counts', paste('at baseline (x ',10^3,'/mm'^3, ')')))) +
+  #xlab('Smear result at baseline') + 
+  xlab('') + scale_fill_brewer(palette = 'Accent') +
+  guides(fill=FALSE) + theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,25)
+
+test_noHIV <- wilcox.test(lab_neut ~ smear_result, data=data_bl_reg_HIV)
+
+pval_smear_HIV <- ifelse(test_noHIV$p.value < 0.001, '<0.001', round(test_noHIV$p.value,3))
+stat.test_smear_HIV <- tibble::tribble(
+  ~group1, ~group2,   ~p.adj,
+    "Positive",     "Negative", pval_smear_HIV
+  )
+
+plot_smear_bl_HIV <- ggboxplot(data_bl_reg_HIVneg, x='smear_result', y='lab_neut', palette = c("#00AFBB", "#E7B800"), fill='smear_result') + 
+  ylab(expression(paste('Neutrophil counts at baseline (x ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(fill='Smear Result at Baseline') + guides(fill=FALSE) +
+  theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,25) +
+  stat_pvalue_manual(stat.test_smear_HIV, y.position = 25, step.increase = 0.1, label = "p.adj")
+
+reg_smear_bsl_HIV <- mi_func(regmodel_bl, formula_ps_bl_noHIV, data=data_bl_reg_HIV, M=M)
+```
+
+
+```{r, warning=FALSE}
+cg_smear_hiv <- compareGroups(smear_result ~ . - HIV, data=data_bl_reg_HIV, max.xlev=20, method=2)
+cg_smear_hivtab1 <- createTable(cg_smear_hiv, show.ratio = TRUE, show.all=TRUE)
+```
+
+```{r, warning=FALSE}
+plot_smear_bl_HIV
+```
+
+
+
+As suggested by the boxplot, we do see a statistical difference on baseline neutrophil counts between those that have positive versus negative MTB culture at month 2. The nonparametric test gives a pvalue of **`r round(test_noHIV$p.value, 3)`**. 
+
+**Adjusted regression:**
+
+```{r, warning=FALSE}
+#reg_smear_bsl_HIV %>% kable(., digits = 3) %>% kable_styling()
+regulartable(reg_smear_bsl_HIV$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+
+```{r, warning=FALSE}
+#reg_smear_bsl_HIV %>% kable(., digits = 3) %>% kable_styling()
+regulartable(reg_smear_bsl_HIV$res_str) %>% theme_zebra() %>% autofit()
+```
+
+### All plots 
+
+```{r}
+library(ggsignif)
+data_bl_reg. <- data_bl_reg %>% mutate(HIV = ifelse(is.na(HIV), NA, ifelse(HIV == 'No', 'HIV Negative', 'HIV Positive'))) %>% filter(!is.na(HIV) & !is.na(smear_result) & !is.na(lab_neut))
+data_bl_reg.$HIV <- as.factor(data_bl_reg.$HIV)
+data_bl_reg.$smear_result <- as.factor(data_bl_reg.$smear_result)
+
+anno_df <- compare_means(lab_neut ~ smear_result, group.by = "HIV", data = data_bl_reg., p.adjust.method = "holm") %>%
+ mutate(y_pos = 26.5, p.adj = format.pval(p.adj, digits = 3))
+anno_df$p.adj <- c(pval_smear_noHIV, pval_smear_HIV)
+
+ggboxplot(data_bl_reg., x='smear_result', y='lab_neut', palette = c("#00AFBB", "#E7B800"), fill='smear_result', facet.by = 'HIV', add.params = list(group = "HIV")) + 
+  ylab(expression(paste('Neutrophil counts at baseline (x ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color=FALSE) + guides(fill=FALSE) +
+  theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) +
+  geom_signif(
+    data=anno_df, 
+    aes(xmin = group1, xmax = group2, annotations = p.adj, y_position = y_pos), 
+    manual= TRUE
+  )
+```
+
+
+
+
+
+
+
+```{r}
+plot_smear_bl_comb <- ggboxplot(data_bl_reg., x='smear_result', y='lab_neut', palette = c("#00AFBB", "#E7B800"), fill='smear_result', facet.by = 'HIV', add.params = list(group = "HIV")) + 
+  ylab(expression(paste('Neutrophil counts at baseline (x ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color=FALSE) + guides(fill=FALSE) +
+  theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) +
+  geom_signif(
+    data=anno_df,
+    aes(xmin = group1, xmax = group2, annotations = p.adj, y_position = y_pos), 
+    manual= TRUE
+  )
+
+require(gridExtra)
+library(cowplot)
+plot_grid(plot_smear_bl, plot_smear_bl_comb, labels = c('A', 'B'), rel_widths  = c(1,1.9))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Smear at month 2 {.tabset}
+
+```{r, warning=FALSE}
+data_bl_m2 <- data_all %>% filter(redcap_event_name %in% c('visita_inicial_arm_1', 'ms_2_visita_arm_1')) %>%
+  as.data.frame() %>% droplevels()
+res_smear_tab <- t(table(data_bl_m2$smear_result, data_bl_m2$redcap_event_name))
+rownames(res_smear_tab) <- c('month 2', 'baseline')
+
+data_smear_m2 <- data_all %>% filter(redcap_event_name == 'ms_2_visita_arm_1') %>%
+  mutate(smear_result_m2 = smear_result) %>% dplyr::select(subjid, smear_result_m2)
+data_bl <- data_all %>% filter(redcap_event_name %in% c('visita_inicial_arm_1')) %>% as.data.frame() %>% droplevels()
+data_merge_smear <- data_bl %>% left_join(data_smear_m2, by='subjid') %>% filter(!is.na(smear_result_m2))
+
+data_merge_smear <- data_merge_smear %>% mutate(smear_result_m2 = ifelse(smear_result_m2==1, 'Positive', 'Negative'))
+
+#data_smear_m2_mariana <- data_merge_smear %>% dplyr::select(subjid, lab_neut, smear_result_m2, HIV)
+#write.table(data_smear_m2_mariana, file = 'C:/users/amorigg1/OneDrive - VUMC/Documents/Afranio/data_smear_m2_mariana.csv', row.names = FALSE, col.names = TRUE, sep=',')
+
+data_m2_reg <- data_merge_smear %>% ungroup() %>% func_vars(.) %>% dplyr::select(subjid, vars_reg, smear_result_m2) %>%
+  filter(!is.na(neutrophils) & !is.na(smear_result_m2))
+
+cg_smear_m2 <- compareGroups(smear_result_m2 ~ ., data=data_merge_smear[, c(vars_cg_m2, 'smear_result_m2')], max.xlev=20, method=2)
+cg_smear_m2tb <- createTable(cg_smear_m2, show.ratio = TRUE, show.all=TRUE)
+
+res_neut_m2 <- wilcox.test(lab_neut ~ smear_result_m2, data=data_merge_smear)
+
+data_merge_smear. <- data_merge_smear
+data_merge_smear.$smear_result_m2 <- as.factor(data_merge_smear.$smear_result_m2)
+pval <- ifelse(res_neut_m2$p.value < 0.001, '<0.001', round(res_neut_m2$p.value,3))
+stat.test <- tibble::tribble(
+  ~group1, ~group2,   ~p.adj,
+    "Positive",     "Negative", 0.926  
+  )
+plot_smear_m2 <- ggboxplot(data_merge_smear., x='smear_result_m2', y='lab_neut', fill='smear_result_m2', palette = c("#00AFBB", "#E7B800")) +
+  ylab(expression(paste('Neutrophil counts at baseline (x  ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color=NULL) + guides(fill=FALSE) + theme(axis.text=element_text(size=12), axis.title=element_text(size=12,face="bold")) + ylim(0,27) + stat_pvalue_manual(stat.test, y.position = 25, step.increase = 0.1, label = "p.adj")
+
+data_merge_smear2 <- data_merge_smear. %>% dplyr::select(vars_reg, smear_result_m2)
+data_merge_smear2$race2 <- as.factor(data_merge_smear2$race2)
+reg_smear_m2 <- mi_func(regmodel_bl, formula_ps_bl_noHIV, data=data_merge_smear2, M=M)
+```
+
+
+
+### Characteristics
+
+Next we look at smear positve at month 2. First we check the number of smear positive and negative at monht 2:
+```{r, warning=FALSE}
+res_smear_tab %>% kable(., col.names = c('Smear negative','Smear positive')) %>% kable_styling(full_width = T)
+```
+
+
+```{r, warning=FALSE}
+export2md(cg_smear_m2tb, size = 8, width = "80px")
+```
+
+### Overall
+
+As before, we start by vizualizying neutrophil counts at baseline, stratified by smear result at month 2.
+
+```{r, warning=FALSE}
+plot_smear_m2
+```
+
+Unlike before, neutrophil counts do not seem to differ across smear results at month 2. This is supported by the univariate Wilcoxon sign test, with a **pvalue of `r round(res_neut_m2$p.value,3)`**. 
+
+Next we adjust for the same confounders as before, namely race, age, sex, smoke status, alcoholhx status, xray cavitation, lymphocytes and platelets counts (both log transformed), as well as diabetes and study site. Xray cavity was again statistically significant, but we cannot claim that neutrophil counts are associated to higher or lower odds of having positive smear at month 2. To save degrees of freedom, lymphocytes and plaquettes were modelled without splines.
+
+```{r, fig.align='center'}
+#reg_smear_m2 %>% kable(., digits = 3) %>% kable_styling()
+regulartable(reg_smear_m2$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+
+```{r, fig.align='center'}
+#reg_smear_m2 %>% kable(., digits = 3) %>% kable_styling()
+regulartable(reg_smear_m2$res_str) %>% theme_zebra() %>% autofit()
+```
+
+
+
+
+
+
+
+### Excluding HIV
+
+```{r, warning=FALSE}
+cg_hiv <- compareGroups(HIV ~ .-subjid, data=data_m2_reg, max.xlev=20, method=2)
+cg_hiv_status_tab1b <- createTable(cg_hiv, show.ratio = TRUE, show.all=TRUE)
+
+data_m2_reg_noHIV <- data_m2_reg %>% filter(HIV == 'No')
+
+cg_nohiv <- compareGroups(smear_result_m2 ~ . - HIV-subjid, data=data_m2_reg_noHIV, max.xlev=20, method=2)
+cg_nohivtab1b <- createTable(cg_nohiv, show.ratio = TRUE, show.all=TRUE)
+
+test_noHIV <- wilcox.test(lab_neut ~ smear_result_m2, data=data_m2_reg_noHIV)
+
+data_m2_reg_noHIV. <- data_m2_reg_noHIV
+data_m2_reg_noHIV.$smear_result_m2 <- as.factor(data_m2_reg_noHIV.$smear_result_m2)
+pval <- ifelse(test_noHIV$p.value < 0.001, '<0.001', round(test_noHIV$p.value,3))
+stat.test_smear_m2_noHIV <- tibble::tribble(
+  ~group1, ~group2,   ~p.adj,
+    "Positive",     "Negative", pval
+  )
+plot_smear_m2_noHIV <- ggboxplot(data_m2_reg_noHIV., x='smear_result_m2', y='lab_neut', fill='smear_result_m2', palette = c("#00AFBB", "#E7B800")) +
+  ylab(expression(paste('Neutrophil counts at baseline (x  ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color=NULL) + guides(fill=FALSE) + theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) + stat_pvalue_manual(stat.test_smear_m2_noHIV, y.position = 25, step.increase = 0.1, label = "p.adj")
+
+data_m2_reg_noHIV. <- data_m2_reg_noHIV %>% filter(!is.na(race2)) %>% dplyr::select(-c(wtloss_change, nightswt_change, subjid))
+reg_smear_m2_noHIV <- mi_func(regmodel_m2, formula_ps_noHIV, data=data_m2_reg_noHIV., M=M)
+```
+
+
+Next we remove those with HIV+. First, a visual comparison of neutrophil counts at baseline stratified by MTB culture at month 2:
+
+```{r, warning=FALSE}
+plot_smear_m2_noHIV
+```
+
+As suggested by the boxplot, we do see a statistical difference on baseline neutrophil counts between those that have positive versus negative MTB culture at month 2. The nonparametric test gives a pvalue of **`r round(test_noHIV$p.value, 3)`**. 
+
+#### Using propensity scores
+
+We used propensity scores as a variable reduction technique. We stratified the log of neutrophil counts into $K$ mutually exclusive groups ($K = 20$) and it via ordinal regression models, using all other variables as covariates in the this model. Continuous variables entered the model via cubic restricted splines. The estimated propensity scores was used as a covariate in the main model, which estimates the association between culture positive at month 2 with neutrophil counts at baseline. Confidence intervals were obtained via 999 boostrap replications.
+
+```{r, warning=FALSE}
+#reg_smear_m2_noHIV %>% kable(., digits = 3) %>% kable_styling()
+regulartable(reg_smear_m2_noHIV$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+```{r, warning=FALSE}
+#reg_smear_m2_noHIV %>% kable(., digits = 3) %>% kable_styling()
+regulartable(reg_smear_m2_noHIV$res_str) %>% theme_zebra() %>% autofit()
+```
+
+
+
+
+
+
+
+### Keeping HIV only
+
+```{r, warning=FALSE}
+data_cd4_hiv <- data_merge_smear %>% dplyr::select(subjid, lab_cd4, ttohiv_yesno) %>%
+  mutate(ttohiv_yesno = ifelse(is.na(ttohiv_yesno) | (ttohiv_yesno==2), NA, ttohiv_yesno))
+data_merge_HIV <- data_m2_reg %>% filter(HIV == 'Yes') %>% left_join(data_cd4_hiv, by='subjid') %>% dplyr::select(-subjid)
+
+cg_nohiv <- compareGroups(smear_result_m2 ~ . - HIV, data=data_merge_HIV, max.xlev=20, method=2)
+cg_hivtab1b <- createTable(cg_nohiv, show.ratio = TRUE, show.all=TRUE)
+
+test_noHIV <- wilcox.test(lab_neut ~ smear_result_m2, data=data_merge_HIV)
+
+data_merge_HIV. <- data_merge_HIV
+data_merge_HIV.$smear_result_m2 <- as.factor(data_merge_HIV$smear_result_m2)
+pval <- ifelse(test_noHIV$p.value < 0.001, '<0.001', round(test_noHIV$p.value,3))
+stat.test_smear_m2_HIV <- tibble::tribble(
+  ~group1, ~group2,   ~p.adj,
+    "Positive",     "Negative", pval
+  )
+plot_smear_m2_HIV <- ggboxplot(data_merge_HIV., x='smear_result_m2', y='lab_neut', fill='smear_result_m2', palette = c("#00AFBB", "#E7B800")) +
+  ylab(expression(paste('Neutrophil counts at baseline (x  ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color=NULL) + guides(fill=FALSE) + theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) + stat_pvalue_manual(stat.test_smear_m2_HIV, y.position = 25, step.increase = 0.1, label = "p.adj")
+
+reg_smear_m2_HIV <- mi_func(regmodel_hiv_m2, formula_ps_HIV, data=data_merge_HIV, M=M)
+```
+
+
+Now we remove those with HIV-. First, a visual comparison of neutrophil counts at baseline stratified by MTB culture at month 2:
+
+```{r, warning=FALSE}
+plot_smear_m2_HIV
+```
+
+As suggested by the boxplot, we do see a statistical difference on baseline neutrophil counts between those that have positive versus negative MTB culture at month 2. The nonparametric test gives a pvalue of **`r round(test_noHIV$p.value, 3)`**. 
+
+#### Using propensity scores
+
+Same procedure as before.
+
+```{r echo=FALSE}
+#reg_smear_m2_HIV %>% kable(., digits = 3) %>% kable_styling()
+regulartable(reg_smear_m2_HIV$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+```{r echo=FALSE}
+#reg_smear_m2_HIV %>% kable(., digits = 3) %>% kable_styling()
+regulartable(reg_smear_m2_HIV$res_str) %>% theme_zebra() %>% autofit()
+```
+
+
+
+
+
+### All plots
+
+```{r}
+data_merge_smear. <- data_merge_smear. %>% mutate(HIV = ifelse(is.na(HIV), NA, ifelse(HIV == 'No', 'HIV Negative', 'HIV Positive'))) %>% filter(!is.na(HIV) & !is.na(smear_result) & !is.na(lab_neut))
+data_merge_smear.$HIV <- as.factor(data_merge_smear.$HIV)
+data_merge_smear.$smear_result_m2 <- as.factor(data_merge_smear.$smear_result_m2)
+
+anno_df <- compare_means(lab_neut ~ smear_result_m2, group.by = "HIV", data = data_merge_smear., p.adjust.method = "holm") %>%
+ mutate(y_pos = 26.5, p.adj = format.pval(p.adj, digits = 3))
+anno_df$p.adj <- c(stat.test_smear_m2_noHIV$p.adj, stat.test_smear_m2_HIV$p.adj)
+
+ggboxplot(data_merge_smear., x='smear_result_m2', y='lab_neut', palette = c("#00AFBB", "#E7B800"), fill='smear_result_m2', facet.by = 'HIV', add.params = list(group = "HIV")) + 
+  ylab(expression(paste('Neutrophil counts at baseline (x ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color=FALSE) + guides(fill=FALSE) +
+  theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) +
+  geom_signif(
+    data=anno_df, 
+    aes(xmin = group1, xmax = group2, annotations = p.adj, y_position = y_pos), 
+    manual= TRUE
+  )
+```
+
+
+
+
+
+```{r}
+plot_smear_m2_comb <- ggboxplot(data_merge_smear., x='smear_result_m2', y='lab_neut', palette = c("#00AFBB", "#E7B800"), fill='smear_result_m2', facet.by = 'HIV', add.params = list(group = "HIV")) + 
+  ylab('') +
+  xlab('') + labs(color=FALSE) + guides(fill=FALSE) +
+  theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) +
+  geom_signif(
+    data=anno_df, 
+    aes(xmin = group1, xmax = group2, annotations = p.adj, y_position = y_pos), 
+    manual= TRUE
+  )
+
+plot_grid(plot_smear_m2, plot_smear_m2_comb, labels = c('A', 'B'), rel_widths  = c(1,1.9))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## MTB culture {.tabset}
+
+```{r, warning=FALSE}
+all_culture_pos <- length(which(data_all$cultura_LiqSol_result_m2[data_all$redcap_event_name=='ms_2_visita_arm_1']=='positive'))
+all_culture_neg <- length(which(data_all$cultura_LiqSol_result_m2[data_all$redcap_event_name=='ms_2_visita_arm_1']=='negative'))
+all_culture_NA <- sum(is.na(data_all$cultura_LiqSol_result_m2[data_all$redcap_event_name=='ms_2_visita_arm_1']))
+positive_mtb <- sum(data_all$cultura_mtb_m2[data_all$redcap_event_name=='ms_2_visita_arm_1']=='positive')
+
+dd <- data_all
+dd$cultura_LiqSol_result_m2 <- as.character(dd$cultura_LiqSol_result_m2)
+dd$cultura_LiqSol_result_m2[is.na(dd$cultura_LiqSol_result_m2)] <- 'Not available'
+nas_id <- dd[dd$redcap_event_name=='ms_2_visita_arm_1',] %>% filter(cultura_LiqSol_result_m2 == 'Not available') %>% dplyr::select(subjid)
+
+data_bl <- data_all %>% filter(redcap_event_name %in% c('visita_inicial_arm_1')) %>% as.data.frame() %>% droplevels()
+data_culture_m2 <- data_all %>% filter(redcap_event_name == 'ms_2_visita_arm_1') %>% mutate(mtb_m2 = cultura_mtb_m2) %>% dplyr::select(subjid, mtb_m2)
+data_merge2 <- data_bl %>% #filter(subjid %in% data_culture_m2$subjid) %>%
+  left_join(data_culture_m2, by='subjid') %>%
+  mutate(mtb_m2 = ifelse(mtb_m2 == 'NA', NA,
+                         ifelse(mtb_m2 == 'negative', 0, 1)))
+data_mtb <- data_merge2 %>% filter(!is.na(mtb_m2)) %>% dplyr::select(vars_cg_m2, mtb_m2) %>%
+  mutate(mtb_m2 = ifelse(mtb_m2==1, 'Positive', 'Negative'))
+
+cg_mtb <- compareGroups(mtb_m2 ~  ., data=data_mtb, max.xlev=20, method=2)
+cg_mtbtab1 <- createTable(cg_mtb, show.ratio = TRUE, show.all=TRUE)
+
+#data_mtb_m2_mariana <- data_mtb %>% dplyr::select(subjid, lab_neut, mtb_m2, HIV)
+#write.table(data_mtb_m2_mariana, file = 'C:/users/amorigg1/OneDrive - VUMC/Documents/Afranio/data_mtb_m2_mariana.csv', row.names = FALSE, col.names = TRUE, sep=',')
+
+
+plot_sites <- ggplot(data_mtb, aes(y=lab_neut, x=SITE)) + geom_boxplot() + theme_classic() +
+  ylab('Neutrophil counts at baseline') +
+  stat_summary(fun.data = give.n, geom = "text", fun.y = median, position = position_dodge(width = 0.5)) + facet_wrap(~mtb_m2)
+
+data_mtb2 <- data_mtb %>% dplyr::select(vars_reg, mtb_m2) %>% filter(!is.na(neutrophils) & !is.na(mtb_m2))
+
+res_mtb2 <- wilcox.test(lab_neut ~ mtb_m2, data=data_mtb)
+
+data_mtb2. <- data_mtb2
+data_mtb2.$mtb_m2 <- as.factor(data_mtb2$mtb_m2)
+pval <- ifelse(res_mtb2$p.value < 0.001, '<0.001', round(res_mtb2$p.value,3))
+stat.test <- tibble::tribble(
+  ~group1, ~group2,   ~p.adj,
+    "Positive",     "Negative", 0.356
+  )
+plot_mtb <- ggboxplot(data_mtb2., x='mtb_m2', y='lab_neut', fill='mtb_m2', palette = c("#00AFBB", "#E7B800")) +
+  ylab(expression(paste('Neutrophil counts at baseline (x  ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color=NULL) + guides(fill=FALSE) + theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) + stat_pvalue_manual(stat.test, y.position = 25, step.increase = 0.1, label = "p.adj")
+
+
+data_mtb2$race2 <- as.factor(data_mtb2$race2)
+data_mtb2$smokhx2 <- as.factor(data_mtb2$smokhx2)
+
+res_mtb_all <- mi_func(regmodel, formula_ps, data=data_mtb2, M=M)
+```
+
+
+
+
+### Characteristics
+
+There were a total of `r all_culture_pos` patients with positive culture at month 2 (liquid + solid). There were also `r all_culture_neg` with negative results. Some people did not have culture results at month 2, others were contaminated, as depicted below:
+
+```{r, warning=FALSE}
+table(dd$cultura_LiqSol_result_m2[dd$redcap_event_name=='ms_2_visita_arm_1']) %>% kable(, col.names = c('Culture result', 'Freq')) %>% kable_styling()
+```
+
+Among all `r all_culture_pos` positive cases, only 40 were also positive for MTB. Next we highlight some of the charactersitics of those with valid culture results at month 2, stratified by their MTB results.
+
+```{r, warning=FALSE}
+export2md(cg_mtbtab1, size = 8, width = "80px")
+```
+
+
+**Statistical association:**
+
+- An univariate Wilcoxon test suggests no association between MTB culture results at month 2 and neutrophil counts at baseline (`r round(res_mtb2$p.value, 3)`). This is also suggested by the boxplot below.
+
+```{r, warning=FALSE}
+plot_mtb
+```
+
+
+**Adjusted regression**: We have very small MTB cases overall, so some variables will be reduced into binary (Y/N) to decrease the number of parameters to be estimated. Study sites will be combined, as some have very low counts. The boxplot below, stratified by MTB result at month 2 (1=positive, 0=negative), show that Rocinha, for example, had only 2 positive MTB at month 2.
+
+```{r, warning=FALSE}
+plot_sites
+```
+
+Due to low counts, Caxias, INI and Rocinha will be combined, so we will have 3 sites only.
+
+#### Propensity scores adjustment
+
+We used propensity scores as a variable reduction technique. We stratified the log of neutrophil counts into $K$ mutually exclusive groups ($K = 20$) and it via ordinal regression models, using all other variables as covariates in the this model. Continuous variables entered the model via cubic restricted splines, with 4 knots equally spaced. The estimated propensity scores was used as a covariate in the main model, which estimates the association between culture positive at month 2 with neutrophil counts at baseline. Confidence intervals were obtained via 999 boostrap replications.
+
+```{r, warning=FALSE}
+#res_mtb_all %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_mtb_all$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+```{r, warning=FALSE}
+#res_mtb_all %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_mtb_all$res_str) %>% theme_zebra() %>% autofit()
+```
+
+
+
+
+
+
+### Excluding HIV
+
+```{r warning=FALSE}
+cg_hiv <- compareGroups(HIV ~  ., data=data_mtb, max.xlev=20, method=2)
+cg_hiv_status_tab2 <- createTable(cg_hiv, show.ratio = TRUE, show.all=TRUE)
+
+data_mtb2_noHIV <- data_mtb2 %>% filter(HIV == 'No')
+
+plot_mtb2_noHIV <- ggplot(data_mtb2_noHIV, aes(x=mtb_m2, y=lab_neut, fill=mtb_m2)) +
+  geom_boxplot() + theme_classic() + 
+  #ylab(expression(paste('Neutrophil counts at baseline (x ', 10^3,'/mm'^3, ')'))) +
+  ylab(expression(atop('Neutrophil counts', paste('at baseline (x ',10^3,'/mm'^3, ')')))) +
+  #xlab('MTB culture result at month 2') +
+  xlab('') + scale_fill_brewer(palette = 'Accent') +
+  guides(fill=FALSE) + theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,25)
+
+cg_nohiv <- compareGroups(mtb_m2 ~ . - HIV, data=data_mtb2_noHIV, max.xlev=20, method=2)
+cg_nohivtab2 <- createTable(cg_nohiv, show.ratio = TRUE, show.all=TRUE)
+
+test_noHIV <- wilcox.test(lab_neut ~ mtb_m2, data=data_mtb2_noHIV)
+
+
+data_mtb2_noHIV. <- data_mtb2_noHIV
+data_mtb2_noHIV.$mtb_m2 <- as.factor(data_mtb2_noHIV$mtb_m2)
+pval <- ifelse(test_noHIV$p.value < 0.001, '<0.001', round(test_noHIV$p.value,3))
+stat.test_noHIV <- tibble::tribble(
+  ~group1, ~group2,   ~p.adj,
+    "Positive",     "Negative", pval
+  )
+plot_mtb2_noHIV <- ggboxplot(data_mtb2_noHIV., x='mtb_m2', y='lab_neut', fill='mtb_m2', palette = c("#00AFBB", "#E7B800")) +
+  ylab(expression(paste('Neutrophil counts at baseline (x  ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color=NULL) + guides(fill=FALSE) + theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) + stat_pvalue_manual(stat.test_noHIV, y.position = 25, step.increase = 0.1, label = "p.adj")
+
+
+res_mtb_noHIV <- mi_func(regmodel, formula_ps_noHIV, data=data_mtb2_noHIV, M=M)
+```
+
+Now we remove those with HIV+. First, a visual comparison of neutrophil counts at baseline stratified by MTB culture at month 2:
+
+```{r, warning=FALSE}
+plot_mtb2_noHIV
+```
+
+As suggested by the boxplot, we do see a statistical difference on baseline neutrophil counts between those that have positive versus negative MTB culture at month 2. The nonparametric test gives a pvalue of **`r round(test_noHIV$p.value, 3)`**.
+
+#### Propensity scores adjustment
+
+Same as before.
+
+```{r, warning=FALSE}
+#res_mtb_noHIV %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_mtb_noHIV$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+```{r, warning=FALSE}
+#res_mtb_noHIV %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_mtb_noHIV$res_str) %>% theme_zebra() %>% autofit()
+```
+
+
+
+
+
+
+
+
+
+
+### Only HIV
+
+```{r, warning=FALSE}
+data_mtb2_HIV <- data_mtb2 %>% filter(HIV == 'Yes')
+
+cg_nohiv <- compareGroups(mtb_m2 ~ . - HIV, data=data_mtb2_HIV, max.xlev=20, method=2)
+cg_hivtab2 <- createTable(cg_nohiv, show.ratio = TRUE, show.all=FALSE)
+
+test_HIV <- wilcox.test(lab_neut ~ mtb_m2, data=data_mtb2_HIV)
+
+data_mtb2_HIV. <- data_mtb2_HIV
+data_mtb2_HIV.$mtb_m2 <- as.factor(data_mtb2_HIV.$mtb_m2)
+pval <- ifelse(test_HIV$p.value < 0.001, '<0.001', round(test_HIV$p.value,3))
+stat.test_HIV <- tibble::tribble(
+  ~group1, ~group2,   ~p.adj,
+    "Positive",     "Negative", pval
+  )
+plot_mtb2_HIV <- ggboxplot(data_mtb2_HIV., x='mtb_m2', y='lab_neut', fill='mtb_m2', palette = c("#00AFBB", "#E7B800")) +
+  ylab(expression(paste('Neutrophil counts at baseline (x  ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color=NULL) + guides(fill=FALSE) + theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) + stat_pvalue_manual(stat.test_HIV, y.position = 25, step.increase = 0.1, label = "p.adj")
+
+
+
+```
+
+Now we remove those with HIV-. First, a visual comparison of neutrophil counts at baseline stratified by MTB culture at month 2:
+
+```{r, warning=FALSE}
+plot_mtb2_HIV
+```
+
+As suggested by the boxplot, we do see a statistical difference on baseline neutrophil counts between those that have positive versus negative MTB culture at month 2. The nonparametric test gives a pvalue of **`r round(test_noHIV$p.value, 3)`**.
+
+
+
+
+
+
+
+
+
+
+
+
+### All plots
+
+```{r}
+data_mtb2. <- data_mtb2. %>% mutate(HIV = ifelse(is.na(HIV), NA, ifelse(HIV == 'No', 'HIV Negative', 'HIV Positive'))) %>% filter(!is.na(HIV) & !is.na(mtb_m2) & !is.na(lab_neut))
+data_mtb2.$HIV <- as.factor(data_mtb2.$HIV)
+data_mtb2.$mtb_m2 <- as.factor(data_mtb2.$mtb_m2)
+
+stat.test <- compare_means(
+ lab_neut ~ mtb_m2, data = data_mtb2_HIV., group.by = 'HIV',
+ method = "t.test"
+) 
+anno_df <- compare_means(lab_neut ~ mtb_m2, group.by = "HIV", data = data_mtb2., p.adjust.method = "holm") %>%
+ mutate(y_pos = 26.5, p.adj = format.pval(p.adj, digits = 3))
+anno_df$p.adj <- c(stat.test_noHIV$p.adj, stat.test_HIV$p.adj)
+
+ggboxplot(data_mtb2., x='mtb_m2', y='lab_neut', palette = c("#00AFBB", "#E7B800"), fill='mtb_m2', facet.by = 'HIV', add.params = list(group = "HIV")) + 
+  ylab(expression(paste('Neutrophil counts at baseline (x ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color=FALSE) + guides(fill=FALSE) +
+  theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) +
+  geom_signif(
+    data=anno_df, 
+    aes(xmin = group1, xmax = group2, annotations = p.adj, y_position = y_pos), 
+    manual= TRUE
+  )
+```
+
+
+
+
+
+```{r}
+plot_mtb_comb <- ggboxplot(data_mtb2., x='mtb_m2', y='lab_neut', palette = c("#00AFBB", "#E7B800"), fill='mtb_m2', facet.by = 'HIV', add.params = list(group = "HIV")) + 
+  ylab('') +
+  xlab('') + labs(color=FALSE) + guides(fill=FALSE) +
+  theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) +
+  geom_signif(
+    data=anno_df, 
+    aes(xmin = group1, xmax = group2, annotations = p.adj, y_position = y_pos), 
+    manual= TRUE
+  )
+
+plot_grid(plot_mtb, plot_mtb_comb, labels = c('A', 'B'), rel_widths  = c(1,1.9))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Treatment outcome {.tabset}
+
+```{r, warning=FALSE}
+data_trt <- data_all %>% filter(!is.na(trt_failure)) %>% filter(redcap_event_name == 'visita_inicial_arm_1') 
+data_trt <- data_trt %>% mutate(bmi_group = ifelse(bmi <= 16, '<= 16', '>16'),
+                                trt_failure = ifelse(trt_failure==1, 'Unfavorable', 'Favorable'),
+                                neutrophils = data_trt$lab_neut) %>% func_vars(.)
+
+cg_trt_all <- compareGroups(trt_failure ~ ., data=data_trt[, c('trt_failure', vars_cg_m2)], max.xlev=20, method=2)
+cg_trt_all <- createTable(cg_trt_all, show.ratio = TRUE, show.all=TRUE)
+
+#data_trt_mariana <- data_trt %>% dplyr::select(subjid, lab_neut, trt_failure, HIV)
+#data_trt_mariana$lab_neut <- data_trt_mariana$lab_neut*1000
+#write.table(data_trt_mariana, file = 'C:/users/amorigg1/OneDrive - VUMC/Documents/Afranio/data_trt_mariana_v2.csv', row.names = FALSE, col.names = TRUE, sep=',')
+
+data_trt <- data_trt %>% dplyr::select(vars_reg, trt_failure)
+cg_trt_hiv_all <- compareGroups(trt_failure ~ ., data=data_trt, max.xlev=20, method=2)
+cg_trt_hiv_all <- createTable(cg_trt_hiv_all, show.ratio = TRUE, show.all=TRUE)
+
+data_trt <- data_trt %>% dplyr::select(vars_reg, trt_failure)# %>% filter(!is.na(trt_failure) & !is.na(neutrophils))
+
+trt_test <- wilcox.test(lab_neut ~ trt_failure, data=data_trt)
+
+data_trt$trt_failure <- as.factor(data_trt$trt_failure)
+pval <- ifelse(trt_test$p.value < 0.001, '<0.001', round(trt_test$p.value,3))
+stat.test <- tibble::tribble(
+  ~group1, ~group2,   ~p.adj,
+    "Favorable",     "Unfavorable", 0.016
+  )
+plot_trt <- ggboxplot(data_trt, x='trt_failure', y='lab_neut', fill='trt_failure', palette = c("#00AFBB", "#E7B800")) +
+  ylab(expression(paste('Neutrophil counts at baseline (x  ',10^3,'/mm'^3, ')'))) +
+  #ylab(expression(atop('Neutrophil counts', paste('at baseline (x ',10^3,'/mm'^3, ')')))) +
+  xlab('') + labs(color=NULL) + guides(fill=FALSE) + theme(axis.text=element_text(size=12), axis.title=element_text(size=12,face="bold")) + ylim(0,27) + stat_pvalue_manual(stat.test, y.position = 25, step.increase = 0.1, label = "p.adj")
+
+res_trt  <- mi_func(regmodel_trt, formula_ps, data=data_trt, M=M)
+
+res_trt_noHIV <- mi_func(regmodel_trt, formula_trt_noHIV, data=data_trt[data_trt$HIV=='No',], M=M)
+```
+
+### Overall:
+
+Discuss associations between neutrophil counts at baseline with treatment outcomes. Treatment status is defined as either unsuccessful or successful. The former is defined as death, treatment failure or TB recurrence, while the latter is defined as cured or treatment completion with no evidence of failure or recurrence in 24 months of follow-up. We follow the similar steps as before, i.e., we fit a logistic regression with neutrphil counts as exposure and treatment status as outcome variable, using propensity score regression adjusment to account for all confounding variables.
+
+We start by discussing the underling characteristics of the study population, i.e., those with a postive or negative treatment outcome.
+
+
+```{r, warning=FALSE}
+export2md(cg_trt_all, size = 8, width = "80px")
+```
+
+```{r, warning=FALSE}
+plot_trt
+```
+
+#### Unadjusted regression:
+The nonparametric Mann-Whitney-Wilcoxon test gives `r round(trt_test$p.value,3)`.
+
+#### Adjusted regression:
+We use the procedure as before, using a propensity score regression adjustment to account for all confounders. Due to limit sample size, apart from age at baseline, we do use restricted cubic splines for continuous variables.
+
+
+```{r, warning=FALSE}
+#res_trt %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_trt$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+```{r, warning=FALSE}
+#res_trt %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_trt$res_str) %>% theme_zebra() %>% autofit()
+```
+
+
+
+
+
+
+
+
+
+### HIV negative
+
+```{r, warning=FALSE}
+data_trt_noHIV <- data_trt %>% filter(HIV=='No')
+
+cg_trt_all <- compareGroups(trt_failure ~ ., data=data_trt_noHIV, max.xlev=20, method=2)
+cg_trt_all_neg <- createTable(cg_trt_all, show.ratio = TRUE, show.all=TRUE)
+
+trt_test_noHIV <- wilcox.test(lab_neut ~ trt_failure, data=data_trt_noHIV)
+
+data_trt_noHIV. <- data_trt_noHIV
+data_trt_noHIV.$trt_failure <- as.factor(data_trt_noHIV.$trt_failure)
+pval <- ifelse(trt_test_noHIV$p.value < 0.001, '<0.001', round(trt_test_noHIV$p.value,3))
+stat.test_trt_noHIV <- tibble::tribble(
+  ~group1, ~group2,   ~p.adj,
+    "Favorable", "Unfavorable", pval
+  )
+plot_trt_noHIV <- ggboxplot(data_trt_noHIV., x='trt_failure', y='lab_neut', fill='trt_failure', palette = c("#00AFBB", "#E7B800")) +
+  ylab(expression(paste('Neutrophil counts at baseline (x  ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color=NULL) + guides(fill=FALSE) + theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) + stat_pvalue_manual(stat.test_trt_noHIV, y.position = 25, step.increase = 0.1, label = "p.adj")
+
+res_trt_noHIV <- mi_func(regmodel_trt, formula_trt_noHIV, data=data_trt_noHIV, M=M)
+```
+
+```{r, warning=FALSE}
+plot_trt_noHIV
+```
+
+#### Unadjusted regression:
+
+The unadjusted regression gives a p-value of `r round(trt_test_noHIV$p.value, 3)`.
+
+#### Adjusted regression:
+We use the same procedure as before; a propensity score regression adjustment to account for all confounders. Due to limited sample size, apart from age at baseline, we do not use restricted cubic splines for continuous variables. Confidence intervals are obtained via nonparametric bootstrap, with 999 bootstrap samples.
+
+```{r, warning=FALSE}
+#res_trt_noHIV %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_trt_noHIV$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+```{r, warning=FALSE}
+#res_trt_noHIV %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_trt_noHIV$res_str) %>% theme_zebra() %>% autofit()
+```
+
+
+
+
+
+
+### HIV positive patients
+
+```{r, warning=FALSE}
+data_trt_HIV <- data_trt %>% filter(HIV=='Yes') %>% dplyr::select(-HIV)
+
+cg_trt_hiv <- compareGroups(trt_failure ~ ., data=data_trt_HIV, max.xlev=20, method=2)
+cg_trt_hiv <- createTable(cg_trt_hiv, show.ratio = TRUE, show.all=TRUE)
+
+trt_test_HIV <- wilcox.test(lab_neut ~ trt_failure, data=data_trt_HIV)
+
+data_trt_HIV. <- data_trt_HIV
+data_trt_HIV.$trt_failure <- as.factor(data_trt_HIV.$trt_failure)
+pval <- ifelse(trt_test_HIV$p.value < 0.001, '<0.001', round(trt_test_HIV$p.value,3))
+stat.test_trt_HIV <- tibble::tribble(
+  ~group1, ~group2,   ~p.adj,
+    "Favorable",     "Unfavorable", pval
+  )
+plot_trt_HIV <- ggboxplot(data_trt_HIV., x='trt_failure', y='lab_neut', fill='trt_failure', palette = c("#00AFBB", "#E7B800")) +
+  ylab(expression(paste('Neutrophil counts at baseline (x  ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color=NULL) + guides(fill=FALSE) + theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) + stat_pvalue_manual(stat.test_trt_HIV, y.position = 25, step.increase = 0.1, label = "p.adj")
+
+plot_trt_HIV
+```
+
+
+#### Unadjusted regression:
+The nonparametric Mann-Whitney-Wilcoxon test gives `r round(trt_test_HIV$p.value,3)`.
+
+
+
+### All plots
+
+
+```{r}
+data_trt. <- data_trt %>% mutate(HIV = ifelse(is.na(HIV), NA, ifelse(HIV == 'No', 'HIV Negative', 'HIV Positive'))) %>% filter(!is.na(HIV) & !is.na(trt_failure) & !is.na(lab_neut))
+data_trt.$HIV <- as.factor(data_trt.$HIV)
+data_trt.$trt_failure <- as.factor(data_trt.$trt_failure)
+
+stat.test <- compare_means(
+ lab_neut ~ trt_failure, data = data_trt., group.by = 'HIV',
+ method = "t.test"
+) 
+anno_df <- compare_means(lab_neut ~ trt_failure, group.by = "HIV", data = data_trt., p.adjust.method = "holm") %>%
+ mutate(y_pos = 26.5, p.adj = format.pval(p.adj, digits = 3))
+anno_df$p.adj <- c(stat.test_trt_noHIV$p.adj, stat.test_trt_HIV$p.adj)
+
+ggboxplot(data_trt., x='trt_failure', y='lab_neut', palette = c("#00AFBB", "#E7B800"), fill='trt_failure', facet.by = 'HIV', add.params = list(group = "HIV")) + 
+  ylab(expression(paste('Neutrophil counts at baseline (x ',10^3,'/mm'^3, ')'))) +
+  xlab('') + labs(color=FALSE) + guides(fill=FALSE) +
+  theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) +
+  geom_signif(
+    data=anno_df, 
+    aes(xmin = group1, xmax = group2, annotations = p.adj, y_position = y_pos), 
+    manual= TRUE
+  )
+```
+
+
+
+
+```{r}
+plot_trt_comb <- ggboxplot(data_trt., x='trt_failure', y='lab_neut', palette = c("#00AFBB", "#E7B800"), fill='trt_failure', facet.by = 'HIV', add.params = list(group = "HIV")) + 
+  ylab('') +
+  xlab('') + labs(color=FALSE) + guides(fill=FALSE) +
+  theme(axis.text=element_text(size=12), axis.title=element_text(size=16,face="bold")) + ylim(0,27) +
+  geom_signif(
+    data=anno_df, 
+    aes(xmin = group1, xmax = group2, annotations = p.adj, y_position = y_pos), 
+    manual= TRUE
+  )
+
+plot_grid(plot_trt, plot_trt_comb, labels = c('A', 'B'), rel_widths  = c(1,1.9))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Treatment outcome, only TB deaths {.tabset}
+
+```{r, warning=FALSE}
+data_trt <- data_all %>% filter(!is.na(trt_failure)) %>% filter(redcap_event_name == 'visita_inicial_arm_1') 
+data_trt <- data_trt %>% mutate(bmi_group = ifelse(bmi <= 16, '<= 16', '>16'),
+                                trt_failure = ifelse(trt_failure==1, 'Unfavorable', 'Favorable'),
+                                neutrophils = data_trt$lab_neut) %>% func_vars(.)
+
+## Only TB deaths
+death_id <- as.character(unique(data_all[data_all$subjid %in% n8,]$subjid))
+only_Tbdeath <- data_all[data_all$subjid %in% death_id & data_all$redcap_event_name=='sada_prematura_arm_1',
+                         c('subjid', 'earlystop_dthcaussp', 'redcap_event_name')] %>% filter(earlystop_dthcaussp==1)
+data_trt <- data_trt[!(data_trt$subjid %in% only_Tbdeath$subjid),]
+##
+
+data_trt <- data_trt %>% dplyr::select(vars_reg, trt_failure)
+trt_test <- wilcox.test(lab_neut ~ trt_failure, data=data_trt)
+data_trt$trt_failure <- as.factor(data_trt$trt_failure)
+res_trt  <- mi_func(regmodel_trt, formula_ps, data=data_trt, M=M)
+res_trt_noHIV <- mi_func(regmodel_trt, formula_trt_noHIV, data=data_trt[data_trt$HIV=='No',], M=M)
+```
+
+#### Unadjusted regression:
+The nonparametric Mann-Whitney-Wilcoxon test gives `r round(trt_test$p.value,3)`.
+
+#### Adjusted regression:
+All:
+```{r, warning=FALSE}
+#res_trt %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_trt$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+HIV negative only:
+```{r, warning=FALSE}
+#res_trt %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_trt_noHIV$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+
+## Treatment outcome, only TB deaths and not sure {.tabset}
+
+```{r, warning=FALSE}
+data_trt <- data_all %>% filter(!is.na(trt_failure)) %>% filter(redcap_event_name == 'visita_inicial_arm_1') 
+data_trt <- data_trt %>% mutate(bmi_group = ifelse(bmi <= 16, '<= 16', '>16'),
+                                trt_failure = ifelse(trt_failure==1, 'Unfavorable', 'Favorable'),
+                                neutrophils = data_trt$lab_neut) %>% func_vars(.)
+
+## Only TB deaths
+death_id <- as.character(unique(data_all[data_all$subjid %in% n8,]$subjid))
+only_Tbdeath <- data_all[data_all$subjid %in% death_id & data_all$redcap_event_name=='sada_prematura_arm_1',
+                         c('subjid', 'earlystop_dthcaussp', 'redcap_event_name')] %>% filter(earlystop_dthcaussp!=2)
+data_trt <- data_trt[!(data_trt$subjid %in% only_Tbdeath$subjid),]
+##
+
+data_trt <- data_trt %>% dplyr::select(vars_reg, trt_failure)
+trt_test <- wilcox.test(lab_neut ~ trt_failure, data=data_trt)
+data_trt$trt_failure <- as.factor(data_trt$trt_failure)
+res_trt  <- mi_func(regmodel_trt, formula_ps, data=data_trt, M=M)
+res_trt_noHIV <- mi_func(regmodel_trt, formula_trt_noHIV, data=data_trt[data_trt$HIV=='No',], M=M)
+```
+
+#### Unadjusted regression:
+The nonparametric Mann-Whitney-Wilcoxon test gives `r round(trt_test$p.value,3)`.
+
+#### Adjusted regression:
+All:
+```{r, warning=FALSE}
+#res_trt %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_trt$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+HIV negative only:
+```{r, warning=FALSE}
+#res_trt %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_trt_noHIV$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+
+## Treatment outcome, Mixed effect {.tabset}
+
+```{r, warning=FALSE}
+data_trt <- data_all %>% filter(!is.na(trt_failure)) %>% filter(redcap_event_name == 'visita_inicial_arm_1') 
+data_trt <- data_trt %>% mutate(bmi_group = ifelse(bmi <= 16, '<= 16', '>16'),
+                                trt_failure = ifelse(trt_failure==1, 'Unfavorable', 'Favorable'),
+                                neutrophils = data_trt$lab_neut) %>% func_vars(.)
+data_trt <- data_trt %>% dplyr::select(vars_reg, trt_failure)
+trt_test <- wilcox.test(lab_neut ~ trt_failure, data=data_trt)
+data_trt$trt_failure <- as.factor(data_trt$trt_failure)
+res_trt  <- mi_func_me(regmodel_trt_me, formula_ps, data=data_trt, M=M)
+res_trt_noHIV <- mi_func_me(regmodel_trt_me, formula_trt_noHIV, data=data_trt[data_trt$HIV=='No',], M=M)
+```
+
+#### Unadjusted regression:
+The nonparametric Mann-Whitney-Wilcoxon test gives `r round(trt_test$p.value,3)`.
+
+#### Adjusted regression:
+All:
+```{r, warning=FALSE}
+#res_trt %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_trt$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+HIV negative only:
+```{r, warning=FALSE}
+#res_trt %>% kable(., digits = 3) %>% kable_styling()
+regulartable(res_trt_noHIV$res_trt) %>% theme_zebra() %>% autofit()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Time to treatment failure {.tabset}
+
+```{r, warning=FALSE}
+data_all$earlystop_date <- as.character(data_all$earlystop_date)
+data_all$bl_visdat <- as.character(data_all$bl_visdat)
+data_all$call_visdat <- as.character(data_all$call_visdat)
+data_all$end_visdat <- as.character(data_all$end_visdat)
+time_to_event1 <- data_all %>% filter(earlystop_date!="") %>% mutate(last_contact = earlystop_date) %>% dplyr::select(subjid, last_contact)
+time_to_event2 <- data_all %>% filter(earlystop_date==""& final_date!="") %>% mutate(last_contact = final_date) %>% dplyr::select(subjid, last_contact)
+time_to_event3 <- data_all %>% filter(earlystop_date==""& call_visdat!="") %>% mutate(last_contact = call_visdat) %>% dplyr::select(subjid, last_contact)
+time_to_event4 <- data_all %>% filter(earlystop_date==""& end_visdat!="") %>% mutate(last_contact = end_visdat) %>% dplyr::select(subjid, last_contact)
+time_to_event5 <- rbind(time_to_event1, time_to_event2, time_to_event3, time_to_event4)
+
+time_to_event5$last_contact <- dmy(time_to_event5$last_contact)
+time_to_event6 <- aggregate(time_to_event5$last_contact, list(time_to_event5$subjid), FUN=function(x) max(x, na.rm=TRUE))
+colnames(time_to_event6) <- c('subjid', 'last_contact')
+
+id0 <- data_all[which(data_all$final_cohaoutb___9 == 1), ]$subjid %>% as.character()
+id1 <- data_all[which(data_all$earlystop_reason == 99), ]$subjid %>% as.character()
+id2a <- data_all[which(data_all$final_cohaoutb___6 == 1), ]$subjid %>% as.character()
+id2b <- data_all[which(data_all$tb_treat_yesno==0), ]$subjid %>% as.character()
+id2 <- intersect(as.character(id2a), as.character(id2b))
+#id2 <- data_all[which(data_all$final_cohaoutb___10 == 1), ]$subjid
+id3 <- data_all[intersect(which(data_all$final_cohaoutb___12 == 1), which(data_all$tb_treat_yesno==0)), ]$subjid %>% as.character()
+id4 <- data_all[which(data_all$final_cohaoutb___11 == 1), ]$subjid %>% as.character()
+id5 <- data_all[which(data_all$earlystop_reason == 7), ]$subjid %>% as.character()
+id6 <- data_all[which(data_all$earlystop_reason %in% c(5:11,99)), ]$subjid %>% as.character()
+
+id_keep <- data_all[which(data_all$final_txcomp == 1), ]$subjid %>% as.character()
+
+ids <- unique(c(id0, id1, id3, id5, id6))
+ids <- ids[!(ids %in% id4)]
+ids <- ids[!(ids %in% id_keep)]
+
+data_trt <- data_all %>% filter(!(subjid %in% ids)) %>%
+  filter(redcap_event_name == 'visita_inicial_arm_1') %>% left_join(time_to_event6, by='subjid') %>%
+  mutate(time_event = as.numeric(last_contact - dmy(bl_visdat))) %>% filter(!is.na(time_event)) %>%
+  mutate(event = ifelse(is.na(trt_failure), 0, ifelse(trt_failure==1, 1, 0)),
+         neutrophils = lab_neut,
+         lab_neut_dictomized = ifelse(lab_neut>7500/1000, '>7500', '<7500'))
+
+data_trt <- data_trt %>% mutate(trt_failure = ifelse(is.na(trt_failure), 0, trt_failure))
+
+data_trt[data_trt$subjid == 'A105017',]$time_event <- as.numeric(dmy('21/11/16') -
+  dmy(data_trt[data_trt$subjid == 'A105017' & data_trt$bl_visdat != '',]$bl_visdat))
+data_trt[data_trt$subjid == 'A105027',]$time_event <- as.numeric(dmy('21/11/16') -
+  dmy(data_trt[data_trt$subjid == 'A105017' & data_trt$bl_visdat != '',]$bl_visdat))
+data_trt[data_trt$subjid == 'A105040',]$time_event <- as.numeric(dmy('16/01/17') -
+  dmy(data_trt[data_trt$subjid == 'A105040' & data_trt$bl_visdat != '',]$bl_visdat))
+```
+
+```{r include=FALSE}
+#Print patients that had treatment failure, with their respective baseline visit data, end visit date and early stop date.
+
+id_falhas <- c("A104025", "A105015", "A105106", "A105147", "A105179", "A105180", "A105188", "A106091", "A106097", "A106101", "A106119", "A106209", "A106237", "A106265", "A106291", "A106330")
+printfalhas <- data_all[data_all$subjid %in% id_falhas, c('subjid', 'bl_visdat', 'end_visdat', 'earlystop_date', 'earlystop_reason')]
+#printfalhas %>% kable() %>% kable_styling()
+```
+
+```{r}
+#data_trt <- data_trt %>% mutate(time_event = ifelse(subjid %in% c('A106011', 'A106032', 'A106083', 'A106141'), 150, time_event))
+data_trt <- data_trt %>% mutate(time_event = ifelse(subjid %in% id_falhas, ifelse(time_event > 210,  150, time_event), time_event))
+
+data_trt <- data_trt %>% dplyr::select(subjid, vars_reg, trt_failure, event, time_event, lab_neut_dictomized) %>%
+  filter(!is.na(neutrophils) & !is.na(time_event) & !is.na(event)) %>%
+  mutate(lab_neut_disc = cut(neutrophils, breaks=c(0, quantile(neutrophils, probs=seq(.1, .9, len=9)), Inf)),
+         lab_neut_disc = as.numeric(lab_neut_disc))
+
+data_trt <- data_trt %>% mutate(time_event = ifelse(time_event > 365.25 * 2, 365.25 * 2, time_event))
+
+#data_trt_mariana_cox <- data_trt %>% dplyr::select(lab_neut, time_event, event, HIV)
+#data_trt_mariana_cox$lab_neut <- data_trt_mariana_cox$lab_neut*1000
+#write.table(data_trt_mariana_cox, file = 'C:/users/amorigg1/OneDrive - VUMC/Documents/Afranio/data_cox_mariana_v2.csv', row.names = FALSE, col.names = TRUE, sep=',')
+
+ddist <- datadist(data_trt)
+options(datadist='ddist')
+
+res.cox  <- cph(Surv(time_event, event) ~ neutrophils, data = data_trt, surv = TRUE)
+res.cox2 <- cph(Surv(time_event, event) ~ lab_neut_dictomized, data = data_trt, surv = TRUE)
+
+data_trt$xray_cavit2 <- as.factor(data_trt$xray_cavit2)
+data_trt$dot_yesno <- as.factor(data_trt$dot_yesno)
+data_trt$race2 <- as.factor(data_trt$race2)
+
+dd <- mice(data_trt[, -1], m=M, printFlag=FALSE)
+dd <- mice::complete(dd, "all")
+mfit <- list()
+for (ii in 1:M){
+  dd_temp <- dd[[ii]]
+  m1 <- orm(formula_surv, data=dd_temp)
+  #dd_temp$ps <- predict(m1, type='mean')
+  #mfit[[ii]] <- coxph(Surv(time_event, event) ~ neutrophils + ps, data = dd_temp)
+  probs_m1 <- predict(m1, type='fitted')
+  probs_add <- rep(NA, nrow(probs_m1))
+  for (i in 1:nrow(probs_m1)){
+    level_fact <- as.numeric(as.character(dd_temp$lab_neut_disc[i]))
+    probs_add[i] <- ifelse(level_fact==1, 1-probs_m1[i,1],
+                           ifelse(level_fact==max(level_fact), probs_m1[i,max(level_fact)-1],
+                                  probs_m1[i,level_fact-1] - probs_m1[i,level_fact]))
+  }
+  dd_temp$ps <- probs_add
+  
+  m1 <- lm(formula_surv, data=dd_temp)
+  dd_temp$ps2 <- dnorm(predict(m1, type='response'), mean=residuals(m1), sd(residuals(m1)))
+  m0 <- lm(I(sqrt(neutrophils)) ~ 1, data=dd_temp)
+  dd_temp$ps1 <- dnorm(predict(m1, type='response'), mean=residuals(m0), sd(residuals(m0)))
+  dd_temp$ps <- dd_temp$ps1/dd_temp$ps2
+  
+  mfit[[ii]] <- coxph(Surv(time_event, event) ~ neutrophils + ps, data = dd_temp)
+}
+coefs_trt <- pool(mfit)
+coefs_pool <- coefs_trt$pooled[1,3]
+sd_pool    <- sqrt(coefs_trt$pooled[1,4])
+cis <- c(coefs_pool - 1.96*sd_pool, coefs_pool + 1.96*sd_pool)
+res.cox_ajd <- exp(data.frame(est=coefs_pool, lci=cis[1], uci=cis[2]))
+```
+
+### Overall:
+
+Next we ran a cox regression estimate how neutrophil counts at baseline are related to the time until treatment failure. Patients are either censored after 24 months of follow up or during their last recorded visit.
+
+#### Kaplan-Meir curve
+
+```{r, warning=FALSE}
+survplot(res.cox)
+
+res.cox2 <- cph(Surv(time_event, event) ~ lab_neut_dictomized, data = data_trt, surv = TRUE)
+survdiff(Surv(time_event, event) ~ lab_neut_dictomized, data=data_trt)
+
+#data_trt_mariana_cox <- data_trt_mariana_cox %>% mutate(lab_neut_dictomized = ifelse(lab_neut < 7500, '<7500', '>7500'))
+
+data_trt <- data_trt %>% mutate(lab_neut_dictomized = ifelse(lab_neut_dictomized == '<7500', '< 7500 Neutrophils', '> 7500 Neutrophils'))
+f <- npsurv(Surv(time_event, event) ~ lab_neut_dictomized, data = data_trt)
+fig_all <- survplotp(f, time.inc=365, ylim=c(.5, 1), xlab='Follow-up time (days)')
+
+```
+
+#### Kaplan-Meir curve, by neutrophilia
+
+```{r, warning=FALSE}
+survplot(res.cox2)
+```
+
+#### UnAdjusted regression
+The unadjusted hazard ratio is:
+
+```{r, warning=FALSE}
+#exp(data.frame(coef = coef(res.cox), lci = confint(res.cox)[1], uci = confint(res.cox)[2])) %>% kable(., digits = 3) %>% kable_styling()
+regulartable(exp(data.frame(coef = coef(res.cox), lci = confint(res.cox)[1], uci = confint(res.cox)[2]))) %>% theme_zebra() %>% autofit()
+```
+
+#### Adjusted regression
+The adjusted hazard ratio is:
+
+```{r, warning=FALSE}
+#res.cox_ajd %>% kable(., digits=3) %>% kable_styling()
+regulartable(res.cox_ajd) %>% theme_zebra() %>% autofit()
+```
+
+
+
+### HIV negative
+
+```{r, warning=FALSE}
+data_trt_noHIV <- data_trt %>% filter(HIV == 'No')
+res.cox_noHIV  <- cph(Surv(time_event, event) ~ neutrophils, data = data_trt_noHIV, surv = TRUE)
+res.cox2_noHIV <- cph(Surv(time_event, event) ~ lab_neut_dictomized, data = data_trt_noHIV, surv = TRUE)
+survdiff(Surv(time_event, event) ~ lab_neut_dictomized, data=data_trt_noHIV)
+
+ddist <- datadist(data_trt_noHIV)
+options(datadist='ddist')
+
+dd <- data_trt_noHIV %>% dplyr::select(-subjid) %>% mice(., m=M, printFlag=FALSE)
+dd <- mice::complete(dd, "all")
+mfit <- list()
+
+for (ii in 1:M){
+  dd_temp <- dd[[ii]]
+  m1 <- orm(formula_surv_noHIV, data=dd_temp)
+#  dd_temp$ps <- predict(m1, type='mean')
+#  (mfit[[ii]] <- coxph(Surv(time_event, event) ~ neutrophils + ps, data = dd_temp))
+  probs_m1 <- predict(m1, type='fitted')
+  probs_add <- rep(NA, nrow(probs_m1))
+  for (i in 1:nrow(probs_m1)){
+    level_fact <- as.numeric(as.character(dd_temp$lab_neut_disc[i]))
+    probs_add[i] <- ifelse(level_fact==1, 1-probs_m1[i,1],
+                           ifelse(level_fact==max(level_fact), probs_m1[i,max(level_fact)-1],
+                                  probs_m1[i,level_fact-1] - probs_m1[i,level_fact]))
+  }
+  dd_temp$ps <- probs_add
+  
+  m1 <- lm(formula_surv_noHIV, data=dd_temp)
+  dd_temp$ps2 <- dnorm(predict(m1, type='response'), mean=residuals(m1), sd(residuals(m1)))
+  m0 <- lm(I(sqrt(neutrophils)) ~ 1, data=dd_temp)
+  dd_temp$ps1 <- dnorm(predict(m1, type='response'), mean=residuals(m0), sd(residuals(m0)))
+  dd_temp$ps <- dd_temp$ps1/dd_temp$ps2
+  
+  mfit[[ii]] <- coxph(Surv(time_event, event) ~ neutrophils + ps, data = dd_temp)
+}
+coefs_trt <- pool(mfit)
+coefs_pool <- coefs_trt$pooled[1,3]
+sd_pool    <- sqrt(coefs_trt$pooled[1,4])
+cis <- c(coefs_pool - 1.96*sd_pool, coefs_pool + 1.96*sd_pool)
+res.cox_ajd_noHIV <- exp(data.frame(est=coefs_pool, lci=cis[1], uci=cis[2]))
+```
+
+#### Kaplan-Meir curve
+
+```{r, warning=FALSE}
+survplot(res.cox_noHIV)
+```
+
+#### Kaplan-Meir curve, by neutrophilia
+
+```{r, warning=FALSE}
+survplot(res.cox2_noHIV)
+
+f <- npsurv(Surv(time_event, event) ~ lab_neut_dictomized, data = data_trt_noHIV)
+fig_nohiv <- survplotp(f, time.inc=365, ylim=c(.5, 1), xlab='Follow-up time (days)')
+```
+
+#### Unadjusted regression
+The unadjusted hazard ratio is:
+
+```{r, warning=FALSE}
+#exp(data.frame(coef = coef(res.cox_noHIV), lci = confint(res.cox_noHIV)[1], uci = confint(res.cox_noHIV)[2])) %>% kable(., digits=3) %>% kable_styling()
+regulartable(exp(data.frame(coef = coef(res.cox_noHIV), lci = confint(res.cox_noHIV)[1], uci = confint(res.cox_noHIV)[2]))) %>% theme_zebra() %>% autofit()
+```
+
+#### Adjusted regression
+The adjusted hazard ratio is:
+
+```{r, warning=FALSE}
+#res.cox_ajd_noHIV %>% kable(., digits=3) %>% kable_styling()
+regulartable(res.cox_ajd_noHIV) %>% theme_zebra() %>% autofit()
+```
+
+
+### HIV positive
+
+```{r, warning=FALSE}
+data_trt_HIV <- data_trt %>% filter(HIV == 'Yes')
+res.cox_HIV  <- cph(Surv(time_event, event) ~ neutrophils, data = data_trt_HIV, surv = TRUE)
+res.cox2_HIV <- cph(Surv(time_event, event) ~ lab_neut_dictomized, data = data_trt_HIV, surv = TRUE)
+survdiff(Surv(time_event, event) ~ lab_neut_dictomized, data=data_trt_HIV)
+
+ddist <- datadist(data_trt_HIV)
+options(datadist='ddist')
+```
+
+#### Kaplan-Meir curve
+
+```{r, warning=FALSE}
+survplot(res.cox_HIV)
+```
+
+#### Kaplan-Meir curve, by neutrophilia
+
+```{r, warning=FALSE}
+#survplotp(res.cox2_HIV)
+
+f <- npsurv(Surv(time_event, event) ~ lab_neut_dictomized, data = data_trt_HIV)
+fig_hiv <- survplotp(f, time.inc=365, ylim=c(.5, 1), xlab='Follow-up time (days)')
+
+```
+
+
+
+
+#### Unadjusted regression
+The unadjusted hazard ratio is:
+
+```{r, warning=FALSE}
+#exp(data.frame(coef = coef(res.cox_HIV), lci = confint(res.cox_HIV)[1], uci = confint(res.cox_HIV)[2])) %>% kable(., digits=3) %>% kable_styling()
+regulartable(exp(data.frame(coef = coef(res.cox_HIV), lci = confint(res.cox_HIV)[1], uci = confint(res.cox_HIV)[2]))) %>% theme_zebra() %>% autofit()
+```
+
+
+### All figures
+
+```{r, widht=16}
+library(plotly)
+subplot(fig_all, fig_nohiv, fig_hiv, nrows = 1)
+```
+
+
+
+
+
+
+
+## Extra tables {.tabset}
+
+### Smear result {.tabset}
+
+
+
+#### By HIV status
+```{r, warning=FALSE}
+export2md(cg_smear_hiv_statustb, size = 8, width = "80px")
+```
+
+#### Only HIV-
+```{r, warning=FALSE}
+export2md(cg_smear_nohivtab1, size = 8, width = "80px")
+```
+
+#### Only HIV+
+```{r, warning=FALSE}
+export2md(cg_smear_hivtab1, size = 8, width = "80px")
+```
+
+
+
+### Smear result {.tabset}
+
+#### By HIV status
+```{r, warning=FALSE}
+export2md(cg_hiv_status_tab1b, size = 8, width = "80px")
+```
+
+#### Only HIV-
+```{r, warning=FALSE}
+export2md(cg_nohivtab1b, size = 8, width = "80px")
+```
+
+#### Only HIV+
+```{r, warning=FALSE}
+export2md(cg_hivtab1b, size = 8, width = "80px")
+```
+
+
+
+
+
+### Culture at month 2 {.tabset}
+
+#### HIV status
+```{r, warning=FALSE}
+export2md(cg_hiv_status_tab2, size = 8, width = "80px")
+```
+
+#### Only HIV-
+```{r, warning=FALSE}
+export2md(cg_nohivtab2, size = 8, width = "80px")
+```
+
+#### Only HIV+
+```{r, warning=FALSE}
+export2md(cg_hivtab2, size = 8, width = "80px")
+```
+
+### Treatment {.tabset}
+
+
+#### HIV status
+```{r, warning=FALSE}
+export2md(cg_trt_hiv_all, size = 8, width = "80px")
+```
+
+#### Only HIV-
+```{r, warning=FALSE}
+export2md(cg_trt_all_neg, size = 8, width = "80px")
+```
+
+#### Only HIV+
+```{r, warning=FALSE}
+export2md(cg_trt_hiv, size = 8, width = "80px")
+```
+
+
+
+
+
+
+
+
+
+
+
+
